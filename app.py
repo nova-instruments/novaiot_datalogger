@@ -1346,7 +1346,7 @@ def render_welcome_page() -> None:
                     <li>Exportação dos dados completos em CSV</li>
                 </ul>
             </div>
-            <div class="welcome-upload-hint">Arraste o arquivo .db do datalogger ou clique abaixo</div>
+            <div class="welcome-upload-hint">Arraste o arquivo do datalogger ou clique abaixo</div>
         """,
         unsafe_allow_html=True,
     )
@@ -1880,7 +1880,7 @@ def main() -> None:
     if db_path is None:
         render_welcome_page()
         uploaded_file = st.file_uploader(
-            "Importar arquivo de dados (.db)",
+            "Importar arquivo de dados",
             key=f"welcome_upload_{st.session_state.file_uploader_nonce}",
         )
         if uploaded_file is not None:
