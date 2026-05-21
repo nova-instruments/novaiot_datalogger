@@ -1,11 +1,18 @@
 import base64
 import sqlite3
 import sys
+from io import BytesIO
 from pathlib import Path
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.graphics.shapes import Drawing, Line, PolyLine, Rect, String
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 TIMEZONE = "America/Sao_Paulo"
 LOGO_PATH = Path("img/logo2026.png")
@@ -1674,6 +1681,170 @@ def render_alarm_monitor(df: pd.DataFrame) -> None:
     st.markdown("".join(history_html), unsafe_allow_html=True)
 
 
+def build_report_pdf(df: pd.DataFrame, source_name: str) -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=1.6 * cm,
+        rightMargin=1.6 * cm,
+        topMargin=1.5 * cm,
+        bottomMargin=1.5 * cm,
+        title="Relatorio Datalogger",
+    )
+    styles = getSampleStyleSheet()
+    story = []
+
+    if LOGO_PATH.exists():
+        try:
+            story.append(Image(str(LOGO_PATH), width=3.4 * cm, height=1.2 * cm))
+            story.append(Spacer(1, 4))
+        except Exception:
+            pass
+
+    story.append(Paragraph("Relatorio do Datalogger", styles["Title"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"Arquivo: {source_name}", styles["Normal"]))
+    story.append(Paragraph(f"Total de registros: {len(df)}", styles["Normal"]))
+
+    temp_series = (
+        pd.to_numeric(df["Tprincipal"], errors="coerce")
+        if "Tprincipal" in df.columns
+        else pd.Series(dtype="float64")
+    )
+    temp_min = temp_series.min() if not temp_series.empty else float("nan")
+    temp_max = temp_series.max() if not temp_series.empty else float("nan")
+    temp_avg = temp_series.mean() if not temp_series.empty else float("nan")
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("Resumo de temperatura", styles["Heading3"]))
+    summary_table = Table(
+        [
+            ["Metrica", "Valor"],
+            ["Temperatura minima", format_metric(temp_min)],
+            ["Temperatura maxima", format_metric(temp_max)],
+            ["Temperatura media", format_metric(temp_avg)],
+        ],
+        colWidths=[7 * cm, 7 * cm],
+    )
+    summary_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+            ]
+        )
+    )
+    story.append(summary_table)
+
+    time_col = get_main_time_column(df)
+    if time_col and "Tprincipal" in df.columns:
+        plot_df = (
+            df[[time_col, "Tprincipal"]]
+            .dropna(subset=[time_col])
+            .sort_values(time_col)
+            .tail(1200)
+            .copy()
+        )
+        plot_df["Tprincipal"] = pd.to_numeric(plot_df["Tprincipal"], errors="coerce")
+        plot_df = plot_df.dropna(subset=["Tprincipal"])
+        if not plot_df.empty:
+            story.append(Spacer(1, 12))
+            story.append(Paragraph("Grafico de temperatura", styles["Heading3"]))
+
+            chart_w = 17.5 * cm
+            chart_h = 6.2 * cm
+            pad_l, pad_r, pad_t, pad_b = 34, 12, 14, 22
+            plot_w = chart_w - pad_l - pad_r
+            plot_h = chart_h - pad_t - pad_b
+            y_vals_full = plot_df["Tprincipal"].tolist()
+            max_points = 260
+            if len(y_vals_full) > max_points:
+                step = max(1, len(y_vals_full) // max_points)
+                sampled = (
+                    plot_df.reset_index(drop=True)
+                    .groupby(plot_df.reset_index(drop=True).index // step)["Tprincipal"]
+                    .mean()
+                    .tolist()
+                )
+                y_vals = sampled
+            else:
+                y_vals = y_vals_full
+
+            y_min = min(y_vals)
+            y_max = max(y_vals)
+            if y_min == y_max:
+                y_min -= 1
+                y_max += 1
+
+            n = len(y_vals)
+            points = []
+            for i, y in enumerate(y_vals):
+                x = pad_l + (i / max(1, n - 1)) * plot_w
+                y_norm = (y - y_min) / (y_max - y_min)
+                y_pix = pad_b + y_norm * plot_h
+                points.extend([x, y_pix])
+
+            drawing = Drawing(chart_w, chart_h)
+            drawing.add(Rect(0, 0, chart_w, chart_h, fillColor=colors.white, strokeColor=colors.white))
+            drawing.add(Rect(pad_l, pad_b, plot_w, plot_h, fillColor=colors.HexColor("#f8fafc"), strokeColor=colors.HexColor("#cbd5e1"), strokeWidth=0.8))
+            for t in (0.25, 0.5, 0.75):
+                gy = pad_b + plot_h * t
+                drawing.add(Line(pad_l, gy, pad_l + plot_w, gy, strokeColor=colors.HexColor("#e2e8f0"), strokeWidth=0.5))
+            drawing.add(PolyLine(points, strokeColor=colors.HexColor("#0d9488"), strokeWidth=1.2))
+            drawing.add(String(2, chart_h - 10, "T", fontSize=8, fillColor=colors.HexColor("#64748b")))
+            drawing.add(String(chart_w - 52, 4, "tempo", fontSize=8, fillColor=colors.HexColor("#64748b")))
+            drawing.add(String(pad_l, 4, f"min: {format_metric(y_min)}", fontSize=8, fillColor=colors.HexColor("#64748b")))
+            drawing.add(String(chart_w - 120, chart_h - 10, f"max: {format_metric(y_max)}", fontSize=8, fillColor=colors.HexColor("#64748b")))
+            story.append(drawing)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Ultimos alarmes", styles["Heading3"]))
+    if "Alarme" in df.columns:
+        alarm_series = pd.to_numeric(df["Alarme"], errors="coerce").fillna(0)
+        alarm_df = df[alarm_series == 1].copy()
+    else:
+        alarm_df = pd.DataFrame()
+
+    if alarm_df.empty:
+        story.append(Paragraph("Nenhum alarme ativo encontrado.", styles["Normal"]))
+    else:
+        rows = [["Data e hora", "Tipo", "Temperatura", "Porta"]]
+        for _, row in alarm_df.tail(10).iloc[::-1].iterrows():
+            row_temp = pd.to_numeric(pd.Series([row.get("Tprincipal")]), errors="coerce").iloc[0]
+            row_door = pd.to_numeric(pd.Series([row.get("Porta")]), errors="coerce").fillna(0).iloc[0]
+            when = format_datetime(row.get(time_col)) if time_col else "-"
+            rows.append(
+                [
+                    when,
+                    classify_alarm(row_temp, row_door),
+                    format_metric(row_temp),
+                    format_metric(row_door),
+                ]
+            )
+        alarm_table = Table(rows, colWidths=[4.8 * cm, 6.1 * cm, 3 * cm, 2.1 * cm])
+        alarm_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(alarm_table)
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
 def main() -> None:
     st.set_page_config(page_title="IoT Datalogger", layout="wide", initial_sidebar_state="collapsed")
 
@@ -1710,7 +1881,6 @@ def main() -> None:
         render_welcome_page()
         uploaded_file = st.file_uploader(
             "Importar arquivo de dados (.db)",
-            type=["db", "sqlite", "sqlite3"],
             key=f"welcome_upload_{st.session_state.file_uploader_nonce}",
         )
         if uploaded_file is not None:
@@ -1785,7 +1955,7 @@ def main() -> None:
                 "<div class='panel-section-title'>Indicadores principais</div>",
                 unsafe_allow_html=True,
             )
-            k1, k2, k3 = st.columns(3)
+            k1, k2, k3, k4 = st.columns(4)
 
             with k1:
                 with st.container(key="kpi-accent"):
@@ -1801,6 +1971,10 @@ def main() -> None:
                 k3.metric("Maior temperatura", format_metric(df["Tprincipal"].max()))
             else:
                 k3.metric("Maior temperatura", "-")
+            if "Tprincipal" in df.columns:
+                k4.metric("Menor temperatura", format_metric(df["Tprincipal"].min()))
+            else:
+                k4.metric("Menor temperatura", "-")
 
         df = render_period_filter(df)
         if df.empty:
@@ -1835,7 +2009,7 @@ def main() -> None:
                 )
             ]
 
-        chip_col, dl_col = st.columns([3, 1])
+        chip_col, dl_col, report_col = st.columns([2.4, 1, 1.2])
         with chip_col:
             chip_class = "result-chip filtered" if search_text else "result-chip"
             st.markdown(
@@ -1846,15 +2020,30 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
         with dl_col:
-            csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
+            excel_buffer = BytesIO()
+            display_df.to_excel(excel_buffer, index=False, sheet_name="Dados")
+            excel_data = excel_buffer.getvalue()
+            source_stem = Path(source_name).stem if source_name else "arquivo"
             st.download_button(
-                "Baixar CSV",
-                data=csv_data,
-                file_name=f"{selected_table}.csv",
-                mime="text/csv",
+                "Exportar Excel",
+                data=excel_data,
+                file_name=f"{source_stem}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
                 use_container_width=True,
                 disabled=display_df.empty,
+            )
+        with report_col:
+            report_pdf = build_report_pdf(df, source_name)
+            source_stem = Path(source_name).stem if source_name else "arquivo"
+            st.download_button(
+                "Gerar Relatório",
+                data=report_pdf,
+                file_name=f"relatorio_{source_stem}.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+                disabled=df.empty,
             )
 
         if display_df.empty:
