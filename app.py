@@ -1,4 +1,5 @@
 import base64
+import os
 import sqlite3
 import sys
 from io import BytesIO
@@ -7,6 +8,7 @@ from pathlib import Path
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
@@ -14,8 +16,29 @@ from reportlab.lib.units import cm
 from reportlab.graphics.shapes import Drawing, Line, PolyLine, Rect, String
 from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+
+def _get_app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return Path(__file__).resolve().parent
+
+
+def _get_data_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        base_dir = Path(local_appdata) / "NovaIoT" if local_appdata else Path.home() / ".novaiot"
+    else:
+        base_dir = Path(__file__).resolve().parent
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir
+
+
+APP_BASE_DIR = _get_app_base_dir()
+DATA_BASE_DIR = _get_data_base_dir()
+TEMP_DIR = DATA_BASE_DIR / "temp"
+
 TIMEZONE = "America/Sao_Paulo"
-LOGO_PATH = Path("img/logo2026.png")
+LOGO_PATH = APP_BASE_DIR / "img" / "logo2026.png"
 CHART_PAGE_SIZE = 250
 TEMP_HIGH_ALARM_LIMIT = 8
 TEMP_LOW_ALARM_LIMIT = 1
@@ -29,6 +52,53 @@ DISPLAY_TIME_COLUMNS = {
 }
 
 
+def render_launcher_heartbeat() -> None:
+    heartbeat_url = os.environ.get("NOVAIOT_HEARTBEAT_URL", "").strip()
+    heartbeat_token = os.environ.get("NOVAIOT_HEARTBEAT_TOKEN", "").strip()
+    if not heartbeat_url or not heartbeat_token:
+        return
+
+    components.html(
+        f"""
+        <script>
+        (() => {{
+            const base = {heartbeat_url!r};
+            const token = {heartbeat_token!r};
+            const mk = (path) => `${{base}}${{path}}?token=${{encodeURIComponent(token)}}&t=${{Date.now()}}`;
+
+            const ping = () => {{
+                const img = new Image();
+                img.src = mk('/ping');
+            }};
+
+            const closeSignal = () => {{
+                try {{
+                    navigator.sendBeacon(mk('/close'));
+                }} catch (e) {{
+                    const img = new Image();
+                    img.src = mk('/close');
+                }}
+            }};
+
+            ping();
+            const id = setInterval(ping, 3000);
+            window.addEventListener('beforeunload', closeSignal);
+            window.addEventListener('pagehide', closeSignal);
+            window.addEventListener('visibilitychange', () => {{
+                if (document.visibilityState === 'visible') {{
+                    ping();
+                }}
+            }});
+
+            window.addEventListener('unload', () => clearInterval(id));
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def is_running_in_streamlit_runtime() -> bool:
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -38,12 +108,11 @@ def is_running_in_streamlit_runtime() -> bool:
 
 
 def get_latest_temp_database() -> Path | None:
-    temp_dir = Path("temp")
-    if not temp_dir.exists():
+    if not TEMP_DIR.exists():
         return None
 
     db_files = [
-        path for path in temp_dir.iterdir()
+        path for path in TEMP_DIR.iterdir()
         if path.is_file() and path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
     ]
     if not db_files:
@@ -52,9 +121,8 @@ def get_latest_temp_database() -> Path | None:
 
 
 def save_uploaded_database(uploaded_file) -> tuple[Path, str]:
-    temp_dir = Path("temp")
-    temp_dir.mkdir(exist_ok=True)
-    temp_path = temp_dir / uploaded_file.name
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = TEMP_DIR / uploaded_file.name
     temp_path.write_bytes(uploaded_file.getbuffer())
     return temp_path, uploaded_file.name
 
@@ -182,36 +250,64 @@ def render_period_filter(df: pd.DataFrame) -> pd.DataFrame:
     min_datetime = df[time_col].min()
     max_datetime = df[time_col].max()
     period_key = f"{time_col}_{len(df)}_{min_datetime.value}_{max_datetime.value}"
+    applied_period_key = f"applied_period_{period_key}"
+
+    if applied_period_key not in st.session_state:
+        st.session_state[applied_period_key] = (
+            min_datetime.to_pydatetime(),
+            max_datetime.to_pydatetime(),
+        )
 
     with st.container(key="filter-strip"):
         st.markdown("<div class='filter-strip-title'>Período</div>", unsafe_allow_html=True)
-        c1, c2, c3, c4 = st.columns([2.2, 1, 2.2, 1], gap="small")
-    start_date = c1.date_input(
-        "Data inicial",
-        value=min_datetime.date(),
-        min_value=min_datetime.date(),
-        max_value=max_datetime.date(),
-        key=f"start_date_{period_key}",
-    )
-    start_time = c2.time_input(
-        "Hora inicial",
-        value=min_datetime.time().replace(microsecond=0),
-        key=f"start_time_{period_key}",
-    )
-    end_date = c3.date_input(
-        "Data final",
-        value=max_datetime.date(),
-        min_value=min_datetime.date(),
-        max_value=max_datetime.date(),
-        key=f"end_date_{period_key}",
-    )
-    end_time = c4.time_input(
-        "Hora final",
-        value=max_datetime.time().replace(microsecond=0),
-        key=f"end_time_{period_key}",
-    )
+        with st.form(key=f"period_form_{period_key}", clear_on_submit=False):
+            applied_start_dt, applied_end_dt = st.session_state[applied_period_key]
+            c1, c2, c3, c4, c5 = st.columns([2.05, 1, 2.05, 1, 1.2], gap="small")
+            start_date = c1.date_input(
+                "Data inicial",
+                value=applied_start_dt.date(),
+                min_value=min_datetime.date(),
+                max_value=max_datetime.date(),
+                key=f"start_date_{period_key}",
+            )
+            start_time = c2.time_input(
+                "Hora inicial",
+                value=applied_start_dt.time().replace(microsecond=0),
+                key=f"start_time_{period_key}",
+            )
+            end_date = c3.date_input(
+                "Data final",
+                value=applied_end_dt.date(),
+                min_value=min_datetime.date(),
+                max_value=max_datetime.date(),
+                key=f"end_date_{period_key}",
+            )
+            end_time = c4.time_input(
+                "Hora final",
+                value=applied_end_dt.time().replace(microsecond=0),
+                key=f"end_time_{period_key}",
+            )
+            confirmed = c5.form_submit_button("Confirmar período", use_container_width=True)
 
-    return filter_by_period(df, start_date, start_time, end_date, end_time)
+        if confirmed:
+            candidate_start = pd.Timestamp.combine(start_date, start_time)
+            candidate_end = pd.Timestamp.combine(end_date, end_time)
+            if candidate_start > candidate_end:
+                st.warning("A data/hora inicial precisa ser menor que a data/hora final.")
+            else:
+                st.session_state[applied_period_key] = (
+                    candidate_start.to_pydatetime(),
+                    candidate_end.to_pydatetime(),
+                )
+
+    applied_start_dt, applied_end_dt = st.session_state[applied_period_key]
+    return filter_by_period(
+        df,
+        applied_start_dt.date(),
+        applied_start_dt.time().replace(microsecond=0),
+        applied_end_dt.date(),
+        applied_end_dt.time().replace(microsecond=0),
+    )
 
 
 def apply_custom_style() -> None:
@@ -310,7 +406,11 @@ def apply_custom_style() -> None:
             [data-testid="stElementToolbarButton"][aria-label*="dados" i],
             button[data-testid="stBaseButton-elementToolbar"][aria-label*="table" i],
             button[data-testid="stBaseButton-elementToolbar"][aria-label*="tabela" i],
+            button[data-testid="stBaseButton-elementToolbar"][aria-label*="show data" i],
+            button[data-testid="stBaseButton-elementToolbar"][aria-label*="mostrar dados" i],
             button[title*="View as table" i],
+            button[title*="Show data" i],
+            button[title*="mostrar dados" i],
             button[title*="tabela" i] {
                 display: none !important;
             }
@@ -1172,7 +1272,9 @@ def apply_custom_style() -> None:
                 border-radius: var(--radius);
                 padding: .85rem 1.1rem 1rem 1.1rem;
                 margin: .5rem 0 1.5rem 0;
-                max-width: 1000px;
+                width: 100%;
+                max-width: none;
+                box-sizing: border-box;
             }
             .filter-strip-title {
                 color: var(--text-muted) !important;
@@ -1285,6 +1387,16 @@ def apply_custom_style() -> None:
             .result-chip.filtered strong {
                 color: var(--accent) !important;
             }
+            /* ---------- Hide Streamlit deploy/menu chrome ---------- */
+            [data-testid="stHeader"],
+            [data-testid="stToolbar"],
+            [data-testid="stDecoration"],
+            #MainMenu,
+            footer {
+                display: none !important;
+                visibility: hidden !important;
+                height: 0 !important;
+            }
             /* ---------- Accessibility ---------- */
             @media (prefers-reduced-motion: reduce) {
                 *, *::before, *::after {
@@ -1343,7 +1455,7 @@ def render_welcome_page() -> None:
                 <ul class="welcome-features">
                     <li>Indicadores e gráficos das medições em tempo real</li>
                     <li>Monitor de alarmes com histórico classificado</li>
-                    <li>Exportação dos dados completos em CSV</li>
+                    <li>Exportação dos dados completos para Excel ou PDF</li>
                 </ul>
             </div>
             <div class="welcome-upload-hint">Arraste o arquivo do datalogger ou clique abaixo</div>
@@ -1369,6 +1481,275 @@ def render_table_overview(df: pd.DataFrame, source_name: str) -> None:
     else:
         c4.metric("Início", "-")
         c5.metric("Fim", "-")
+
+
+def build_temperature_trend_areas(
+    plot_df: pd.DataFrame,
+    time_col: str,
+    temperature_col: str,
+) -> pd.DataFrame:
+    trend_df = (
+        plot_df[[time_col, temperature_col]]
+        .dropna()
+        .sort_values(time_col)
+        .reset_index(drop=True)
+    )
+
+    if len(trend_df) < 2:
+        return pd.DataFrame(columns=["DataHora", "Temperatura", "Area", "Segmento"])
+
+    trend_df["Delta"] = trend_df[temperature_col].diff()
+    trend_df["TrendRaw"] = trend_df["Delta"].apply(
+        lambda value: "up" if value > 0 else ("down" if value < 0 else None)
+    )
+
+    if trend_df["TrendRaw"].dropna().empty:
+        # Sem variação no período inteiro: divide em metade quente/metade fria.
+        split_idx = len(trend_df) // 2
+        if split_idx <= 0 or split_idx >= len(trend_df):
+            return pd.DataFrame(columns=["DataHora", "Temperatura", "Area", "Segmento"])
+
+        first_half = trend_df.iloc[: split_idx + 1].copy()
+        second_half = trend_df.iloc[split_idx:].copy()
+        first_half["Area"] = "Área quente"
+        first_half["Segmento"] = "Área quente_1"
+        second_half["Area"] = "Área fria"
+        second_half["Segmento"] = "Área fria_1"
+
+        return (
+            pd.concat(
+                [
+                    first_half.rename(columns={time_col: "DataHora", temperature_col: "Temperatura"})[
+                        ["DataHora", "Temperatura", "Area", "Segmento"]
+                    ],
+                    second_half.rename(columns={time_col: "DataHora", temperature_col: "Temperatura"})[
+                        ["DataHora", "Temperatura", "Area", "Segmento"]
+                    ],
+                ],
+                ignore_index=True,
+            )
+            .sort_values("DataHora")
+            .reset_index(drop=True)
+        )
+
+    # Em cada trecho estável (delta=0), aplica divisão 50/50 (quente/fria).
+    trend_df["Trend"] = trend_df["TrendRaw"].copy()
+    stable_indices = [
+        idx for idx in range(1, len(trend_df))
+        if trend_df.loc[idx, "Trend"] is None
+    ]
+    run_start = None
+    prev_idx = None
+    stable_runs: list[tuple[int, int]] = []
+    for idx in stable_indices:
+        if run_start is None:
+            run_start = idx
+            prev_idx = idx
+            continue
+        if idx != prev_idx + 1:
+            stable_runs.append((run_start, prev_idx))
+            run_start = idx
+        prev_idx = idx
+    if run_start is not None:
+        stable_runs.append((run_start, prev_idx))
+
+    for start_idx, end_idx in stable_runs:
+        run_len = end_idx - start_idx + 1
+        split = run_len // 2
+        for offset, idx in enumerate(range(start_idx, end_idx + 1)):
+            trend_df.loc[idx, "Trend"] = "up" if offset < split else "down"
+
+    points: list[dict[str, object]] = []
+    active_trend = None
+    segment_idx = 0
+
+    for idx in range(1, len(trend_df)):
+        current_trend = trend_df.loc[idx, "Trend"]
+        if current_trend is None:
+            continue
+
+        if active_trend is None:
+            active_trend = current_trend
+            segment_idx += 1
+        elif current_trend != active_trend:
+            active_trend = current_trend
+            segment_idx += 1
+
+        area_name = "Área quente" if active_trend == "up" else "Área fria"
+        segment_name = f"{area_name}_{segment_idx}"
+
+        previous_point = trend_df.loc[idx - 1]
+        current_point = trend_df.loc[idx]
+        points.append(
+            {
+                "DataHora": previous_point[time_col],
+                "Temperatura": previous_point[temperature_col],
+                "Area": area_name,
+                "Segmento": segment_name,
+            }
+        )
+        points.append(
+            {
+                "DataHora": current_point[time_col],
+                "Temperatura": current_point[temperature_col],
+                "Area": area_name,
+                "Segmento": segment_name,
+            }
+        )
+
+    if not points:
+        return pd.DataFrame(columns=["DataHora", "Temperatura", "Area", "Segmento"])
+
+    return (
+        pd.DataFrame(points)
+        .drop_duplicates(subset=["DataHora", "Area", "Segmento"])
+        .sort_values("DataHora")
+        .reset_index(drop=True)
+    )
+
+
+def build_streamlit_temperature_areas(
+    plot_df: pd.DataFrame,
+    time_col: str,
+    temperature_col: str,
+) -> pd.DataFrame:
+    trend_df = (
+        plot_df[[time_col, temperature_col]]
+        .dropna()
+        .sort_values(time_col)
+        .reset_index(drop=True)
+    )
+
+    if trend_df.empty:
+        return pd.DataFrame(columns=[time_col, "Área quente", "Área fria"])
+
+    trend = trend_df[temperature_col].diff().apply(
+        lambda value: "up" if value > 0 else ("down" if value < 0 else None)
+    )
+    trend = trend.ffill().bfill()
+
+    streamlit_area_df = trend_df[[time_col, temperature_col]].copy()
+    streamlit_area_df["Área quente"] = streamlit_area_df[temperature_col].where(trend.eq("up"))
+    streamlit_area_df["Área fria"] = streamlit_area_df[temperature_col].where(trend.eq("down"))
+    return streamlit_area_df[[time_col, "Área quente", "Área fria"]]
+
+
+def compute_temperature_segment_durations(
+    plot_df: pd.DataFrame,
+    time_col: str,
+    temperature_col: str,
+) -> pd.DataFrame:
+    trend_df = (
+        plot_df[[time_col, temperature_col]]
+        .dropna()
+        .sort_values(time_col)
+        .reset_index(drop=True)
+    )
+
+    if len(trend_df) < 2:
+        return pd.DataFrame(columns=["Area", "Inicio", "Fim", "DuracaoSegundos", "Segmento"])
+
+    trend_df["Delta"] = trend_df[temperature_col].diff()
+    trend_df["Trend"] = trend_df["Delta"].apply(
+        lambda value: "up" if value > 0 else ("down" if value < 0 else None)
+    )
+
+    intervals: list[dict[str, object]] = []
+    for idx in range(1, len(trend_df)):
+        direction = trend_df.loc[idx, "Trend"]
+        if direction is None:
+            continue
+
+        start_time = trend_df.loc[idx - 1, time_col]
+        end_time = trend_df.loc[idx, time_col]
+        if pd.isna(start_time) or pd.isna(end_time) or end_time <= start_time:
+            continue
+
+        intervals.append(
+            {
+                "Trend": direction,
+                "Inicio": start_time,
+                "Fim": end_time,
+            }
+        )
+
+    if not intervals:
+        return pd.DataFrame(columns=["Area", "Inicio", "Fim", "DuracaoSegundos", "Segmento"])
+
+    segments: list[dict[str, object]] = []
+    for interval in intervals:
+        area = "Área quente" if interval["Trend"] == "up" else "Área fria"
+        if not segments:
+            segments.append(
+                {
+                    "Area": area,
+                    "Trend": interval["Trend"],
+                    "Inicio": interval["Inicio"],
+                    "Fim": interval["Fim"],
+                }
+            )
+            continue
+
+        previous = segments[-1]
+        if (
+            previous["Trend"] == interval["Trend"]
+            and interval["Inicio"] <= previous["Fim"]
+        ):
+            if interval["Fim"] > previous["Fim"]:
+                previous["Fim"] = interval["Fim"]
+        else:
+            segments.append(
+                {
+                    "Area": area,
+                    "Trend": interval["Trend"],
+                    "Inicio": interval["Inicio"],
+                    "Fim": interval["Fim"],
+                }
+            )
+
+    if not segments:
+        return pd.DataFrame(columns=["Area", "Inicio", "Fim", "DuracaoSegundos", "Segmento"])
+
+    segment_count = {"Área quente": 0, "Área fria": 0}
+    parsed_segments: list[dict[str, object]] = []
+    for segment in segments:
+        area = str(segment["Area"])
+        start_time = segment["Inicio"]
+        end_time = segment["Fim"]
+        duration_seconds = float((end_time - start_time).total_seconds())
+        if duration_seconds <= 0:
+            continue
+
+        segment_count[area] = segment_count.get(area, 0) + 1
+        parsed_segments.append(
+            {
+                "Area": area,
+                "Inicio": start_time,
+                "Fim": end_time,
+                "DuracaoSegundos": duration_seconds,
+                "Segmento": f"{area} #{segment_count[area]}",
+            }
+        )
+
+    if not parsed_segments:
+        return pd.DataFrame(columns=["Area", "Inicio", "Fim", "DuracaoSegundos", "Segmento"])
+
+    return pd.DataFrame(parsed_segments)
+
+
+def format_duration(seconds: float) -> str:
+    if pd.isna(seconds) or seconds <= 0:
+        return "0s"
+
+    total_seconds = int(round(float(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def render_main_plot(df: pd.DataFrame, selected_columns: list[str]) -> None:
@@ -1451,28 +1832,55 @@ def render_main_plot(df: pd.DataFrame, selected_columns: list[str]) -> None:
         var_name="Medição",
         value_name="Valor",
     )
+    x_min_for_chart = page_df[time_col].min()
+    x_max_for_chart = page_df[time_col].max()
     y_values = chart_df["Valor"].dropna()
     y_scale = alt.Scale(zero=False)
+    y_min_for_chart = -1.0
+    y_max_for_chart = 1.0
     if not y_values.empty:
         y_min = float(y_values.min())
         y_max = float(y_values.max())
         y_range = y_max - y_min
         margin = y_range * 0.08 if y_range else max(abs(y_max) * 0.08, 1)
-        y_scale = alt.Scale(domain=[y_min - margin, y_max + margin], zero=False)
+        y_min_for_chart = y_min - margin
+        y_max_for_chart = y_max + margin
+        y_scale = alt.Scale(domain=[y_min_for_chart, y_max_for_chart], zero=False)
 
-    zoom_selection = alt.selection_interval(
-        bind="scales",
-        name=f"zoom_{current_page}_{st.session_state.chart_reset_nonce}",
+    temperature_reference_col = "Tprincipal" if "Tprincipal" in selected_columns else selected_columns[0]
+    trend_areas_df = build_temperature_trend_areas(
+        page_df,
+        time_col,
+        temperature_reference_col,
+    )
+    segment_durations_df = compute_temperature_segment_durations(
+        page_df,
+        time_col,
+        temperature_reference_col,
+    )
+
+    zoom_brush = alt.selection_interval(
+        encodings=["x"],
+        name=f"brush_{current_page}_{st.session_state.chart_reset_nonce}",
+        value={"x": [x_min_for_chart, x_max_for_chart]},
     )
     series_palette = ["#0d9488", "#6366f1", "#f59e0b", "#ec4899", "#14b8a6", "#8b5cf6"]
-    chart = (
+    hover_selection = alt.selection_point(
+        fields=[time_col, "Medição"],
+        nearest=True,
+        on="pointermove",
+        empty=False,
+        clear="pointerout",
+    )
+    line_chart = (
         alt.Chart(chart_df)
         .mark_line(strokeWidth=2.5, interpolate="monotone")
         .encode(
             x=alt.X(
                 f"{time_col}:T",
                 title="Data e hora",
-                axis=alt.Axis(labelFontSize=13, titleFontSize=14, labelPadding=6),
+                scale=alt.Scale(domain=zoom_brush, clamp=True, nice=False),
+                axis=alt.Axis(labelFontSize=13, titleFontSize=14, labelPadding=6, format="%H:%M"),
             ),
             y=alt.Y(
                 "Valor:Q",
@@ -1492,16 +1900,117 @@ def render_main_plot(df: pd.DataFrame, selected_columns: list[str]) -> None:
                 alt.Tooltip("Valor:Q", title="Valor", format=",.2f"),
             ],
         )
-        .properties(height=520)
-        .add_params(zoom_selection)
+    )
+    point_chart = (
+        alt.Chart(chart_df)
+        .mark_circle(size=90, stroke="white", strokeWidth=1.2)
+        .encode(
+            x=alt.X(
+                f"{time_col}:T",
+                scale=alt.Scale(domain=zoom_brush, clamp=True, nice=False),
+            ),
+            y=alt.Y("Valor:Q", scale=y_scale),
+            color=alt.Color("Medição:N", scale=alt.Scale(range=series_palette), legend=None),
+            opacity=alt.condition(hover_selection, alt.value(1), alt.value(0)),
+            tooltip=[
+                alt.Tooltip(f"{time_col}:T", title="Data e hora", format="%d/%m/%Y %H:%M:%S"),
+                alt.Tooltip("Medição:N", title="Medição"),
+                alt.Tooltip("Valor:Q", title="Valor", format=",.2f"),
+            ],
+        )
+        .add_params(hover_selection)
+    )
+
+    chart = alt.layer(line_chart, point_chart)
+    if not trend_areas_df.empty:
+        trend_areas_df = trend_areas_df.copy()
+        trend_areas_df["Base"] = y_min_for_chart
+        trend_area_layer = (
+            alt.Chart(trend_areas_df)
+            .mark_area(opacity=0.22, interpolate="monotone")
+            .encode(
+                x=alt.X(
+                    "DataHora:T",
+                    title="Data e hora",
+                    scale=alt.Scale(domain=zoom_brush, clamp=True, nice=False),
+                ),
+                y=alt.Y(
+                    "Temperatura:Q",
+                    scale=y_scale,
+                    title="Valor",
+                    axis=alt.Axis(labelFontSize=13, titleFontSize=14, labelPadding=6),
+                ),
+                y2="Base:Q",
+                color=alt.Color(
+                    "Area:N",
+                    title="Faixa térmica",
+                    scale=alt.Scale(domain=["Área quente", "Área fria"], range=["#ef4444", "#3b82f6"]),
+                    legend=alt.Legend(orient="top", labelFontSize=13, titleFontSize=13),
+                ),
+                detail="Segmento:N",
+            )
+        )
+        chart = alt.layer(trend_area_layer, line_chart, point_chart).resolve_scale(color="independent")
+
+    chart = chart.properties(height=450)
+
+    overview_chart = (
+        alt.Chart(chart_df)
+        .mark_line(strokeWidth=1.2, opacity=0.7)
+        .encode(
+            x=alt.X(
+                f"{time_col}:T",
+                title="Faixa para zoom",
+                axis=alt.Axis(format="%H:%M"),
+            ),
+            y=alt.Y("Valor:Q", title=None, axis=alt.Axis(labels=False, ticks=False, domain=False, grid=False)),
+            color=alt.Color("Medição:N", scale=alt.Scale(range=series_palette), legend=None),
+        )
+        .add_params(zoom_brush)
+        .properties(height=95)
+    )
+
+    chart_with_brush = (
+        alt.vconcat(chart, overview_chart, spacing=8)
         .configure_view(strokeWidth=0)
-        .configure_axis(grid=True, gridColor="#e2e8f0", gridOpacity=0.6, domainColor="#cbd5e1", tickColor="#cbd5e1", labelColor="#64748b", titleColor="#0f172a")
+        .configure_axis(
+            grid=True,
+            gridColor="#e2e8f0",
+            gridOpacity=0.6,
+            domainColor="#cbd5e1",
+            tickColor="#cbd5e1",
+            labelColor="#64748b",
+            titleColor="#0f172a",
+        )
     )
     st.altair_chart(
-        chart,
+        chart_with_brush,
         use_container_width=True,
         key=f"main_chart_{current_page}_{st.session_state.chart_reset_nonce}",
     )
+
+    st.caption(
+        "Faixas em vermelho indicam momentos de subida de temperatura; "
+        "faixas em azul indicam momentos de descida."
+    )
+
+    if not segment_durations_df.empty:
+        hot_segments = segment_durations_df[segment_durations_df["Area"] == "Área quente"]
+        cold_segments = segment_durations_df[segment_durations_df["Area"] == "Área fria"]
+
+        hot_avg_seconds = hot_segments["DuracaoSegundos"].mean() if not hot_segments.empty else 0.0
+        cold_avg_seconds = cold_segments["DuracaoSegundos"].mean() if not cold_segments.empty else 0.0
+        hot_total_seconds = hot_segments["DuracaoSegundos"].sum() if not hot_segments.empty else 0.0
+        cold_total_seconds = cold_segments["DuracaoSegundos"].sum() if not cold_segments.empty else 0.0
+
+        st.caption("Média calculada no período exibido nesta página do gráfico (até 250 pontos).")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Média faixa quente", format_duration(hot_avg_seconds))
+        m2.metric("Média faixa fria", format_duration(cold_avg_seconds))
+        m3.metric("Tempo total quente", format_duration(hot_total_seconds))
+        m4.metric("Tempo total frio", format_duration(cold_total_seconds))
+    else:
+        st.caption("Não há pontos suficientes nesta página para calcular médias de faixas térmicas.")
 
 ALARM_GLYPHS = {
     "high": "▲",
@@ -1849,6 +2358,7 @@ def main() -> None:
     st.set_page_config(page_title="IoT Datalogger", layout="wide", initial_sidebar_state="collapsed")
 
     apply_custom_style()
+    render_launcher_heartbeat()
 
     if "file_uploader_nonce" not in st.session_state:
         st.session_state.file_uploader_nonce = 0
@@ -1949,6 +2459,11 @@ def main() -> None:
 
     if active_view == "Painel":
         render_table_overview(df, source_name)
+        filtered_df = render_period_filter(df)
+        if filtered_df.empty:
+            st.warning("Não há dados para mostrar no período selecionado.")
+            st.stop()
+            return
 
         if selected_table == "DataGrpData":
             st.markdown(
@@ -1959,30 +2474,24 @@ def main() -> None:
 
             with k1:
                 with st.container(key="kpi-accent"):
-                    if "Tprincipal" in df.columns:
-                        st.metric("Temperatura média", format_metric(df["Tprincipal"].mean()))
+                    if "Tprincipal" in filtered_df.columns:
+                        st.metric("Temperatura média", format_metric(filtered_df["Tprincipal"].mean()))
                     else:
                         st.metric("Temperatura média", "-")
-            if "Setpoint" in df.columns:
-                k2.metric("Setpoint médio", format_metric(df["Setpoint"].mean()))
+            if "Setpoint" in filtered_df.columns:
+                k2.metric("Setpoint médio", format_metric(filtered_df["Setpoint"].mean()))
             else:
                 k2.metric("Setpoint médio", "-")
-            if "Tprincipal" in df.columns:
-                k3.metric("Maior temperatura", format_metric(df["Tprincipal"].max()))
+            if "Tprincipal" in filtered_df.columns:
+                k3.metric("Maior temperatura", format_metric(filtered_df["Tprincipal"].max()))
             else:
                 k3.metric("Maior temperatura", "-")
-            if "Tprincipal" in df.columns:
-                k4.metric("Menor temperatura", format_metric(df["Tprincipal"].min()))
+            if "Tprincipal" in filtered_df.columns:
+                k4.metric("Menor temperatura", format_metric(filtered_df["Tprincipal"].min()))
             else:
                 k4.metric("Menor temperatura", "-")
 
-        df = render_period_filter(df)
-        if df.empty:
-            st.warning("Não há dados para mostrar no período selecionado.")
-            st.stop()
-            return
-
-        plot_columns = get_preferred_plot_columns(df)
+        plot_columns = get_preferred_plot_columns(filtered_df)
         default_plot_columns = [
             col for col in ["Tprincipal", "Setpoint"]
             if col in plot_columns
@@ -1992,7 +2501,7 @@ def main() -> None:
             plot_columns,
             default=default_plot_columns,
         )
-        render_main_plot(df, selected_plot_columns)
+        render_main_plot(filtered_df, selected_plot_columns)
 
     elif active_view == "Dados completos":
         st.subheader("Dados completos")
