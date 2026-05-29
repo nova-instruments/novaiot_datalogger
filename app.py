@@ -39,7 +39,6 @@ TEMP_DIR = DATA_BASE_DIR / "temp"
 
 TIMEZONE = "America/Sao_Paulo"
 LOGO_PATH = APP_BASE_DIR / "img" / "logo2026.png"
-CHART_PAGE_SIZE = 250
 TEMP_HIGH_ALARM_LIMIT = 8
 TEMP_LOW_ALARM_LIMIT = 1
 RAW_TIME_COLUMNS = ["CollectTime", "StartTime", "EndTime", "Timestamp", "Time"]
@@ -107,17 +106,17 @@ def is_running_in_streamlit_runtime() -> bool:
         return False
 
 
-def get_latest_temp_database() -> Path | None:
+def get_latest_temp_data_file() -> Path | None:
     if not TEMP_DIR.exists():
         return None
 
-    db_files = [
+    data_files = [
         path for path in TEMP_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+        if path.is_file() and path.suffix.lower() in {".db", ".sqlite", ".sqlite3", ".txt"}
     ]
-    if not db_files:
+    if not data_files:
         return None
-    return max(db_files, key=lambda path: path.stat().st_mtime)
+    return max(data_files, key=lambda path: path.stat().st_mtime)
 
 
 def save_uploaded_database(uploaded_file) -> tuple[Path, str]:
@@ -125,6 +124,77 @@ def save_uploaded_database(uploaded_file) -> tuple[Path, str]:
     temp_path = TEMP_DIR / uploaded_file.name
     temp_path.write_bytes(uploaded_file.getbuffer())
     return temp_path, uploaded_file.name
+
+
+def normalize_time_fragment(time_fragment: str) -> str:
+    parts = [p.strip() for p in str(time_fragment).split(":")]
+    if len(parts) != 3:
+        return str(time_fragment).strip()
+    hh, mm, ss = parts
+    return f"{hh.zfill(2)}:{mm.zfill(2)}:{ss.zfill(2)}"
+
+
+def parse_datalogger_txt(txt_path: str) -> tuple[pd.DataFrame, str]:
+    text = Path(txt_path).read_text(encoding="utf-8", errors="replace")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("Arquivo TXT vazio.")
+
+    name_value = "-"
+    rows_start = 0
+    if lines[0].upper().startswith("NAME:"):
+        name_value = lines[0][len("NAME:"):].strip() or "-"
+        rows_start = 1
+
+    if len(lines) <= rows_start:
+        raise ValueError("Cabeçalho de dados não encontrado no TXT.")
+
+    header_line = lines[rows_start]
+    data_lines = lines[rows_start + 1:]
+    if not data_lines:
+        raise ValueError("Não há linhas de dados no TXT.")
+
+    csv_buffer = "\n".join([header_line] + data_lines)
+    df = pd.read_csv(
+        BytesIO(csv_buffer.encode("utf-8")),
+        sep=";",
+        dtype=str,
+    )
+    df.columns = [col.strip() for col in df.columns]
+
+    rename_map = {
+        "R": "Registro",
+        "Data Hora": "Time",
+        "TPrincipal": "Tprincipal",
+        "PA": "Porta",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    if "Time" in df.columns:
+        normalized_time_values = []
+        for raw_value in df["Time"].fillna("").astype(str):
+            cleaned = raw_value.strip()
+            if not cleaned:
+                normalized_time_values.append(cleaned)
+                continue
+            parts = cleaned.split()
+            if len(parts) >= 2:
+                date_part = parts[0]
+                time_part = normalize_time_fragment(parts[1])
+                normalized_time_values.append(f"{date_part} {time_part}")
+            else:
+                normalized_time_values.append(cleaned)
+        df["Time"] = normalized_time_values
+
+    for col in ["Registro", "Porta", "Tprincipal"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "Porta" in df.columns:
+        porta_series = pd.to_numeric(df["Porta"], errors="coerce").fillna(0)
+        df["Alarme"] = (porta_series == 1).astype(int)
+
+    return df, name_value
 
 
 @st.cache_data(show_spinner=False)
@@ -148,6 +218,16 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # Detecta e converte colunas de tempo comuns
     for col in RAW_TIME_COLUMNS:
         if col in out.columns:
+            if col == "Time":
+                try:
+                    out[col + "_dt"] = pd.to_datetime(
+                        out[col],
+                        format="%d/%m/%y %H:%M:%S",
+                        errors="coerce",
+                    )
+                    continue
+                except Exception:
+                    pass
             try:
                 out[col + "_dt"] = (
                     pd.to_datetime(out[col], unit="ms", utc=True)
@@ -156,7 +236,7 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                 )
             except Exception:
                 try:
-                    out[col + "_dt"] = pd.to_datetime(out[col], errors="coerce")
+                    out[col + "_dt"] = pd.to_datetime(out[col], errors="coerce", dayfirst=True)
                 except Exception:
                     pass
 
@@ -179,6 +259,13 @@ def format_datetime(value) -> str:
     return str(value)
 
 
+def truncate_text(value: str, max_len: int = 18) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_len:
+        return text
+    return f"{text[:max_len - 3]}..."
+
+
 def get_main_time_column(df: pd.DataFrame) -> str | None:
     for col in ["CollectTime_dt", "StartTime_dt", "EndTime_dt", "Timestamp_dt", "Time_dt"]:
         if col in df.columns and df[col].notna().any():
@@ -197,11 +284,18 @@ def get_logo_data_uri(logo_path: str) -> str:
     return f"data:{mime_type};base64,{encoded_logo}"
 
 
-def get_preferred_plot_columns(df: pd.DataFrame) -> list[str]:
+def get_preferred_plot_columns(df: pd.DataFrame, is_txt_source: bool = False) -> list[str]:
     preferred_cols = ["Tprincipal", "Setpoint"]
+    ignored_plot_columns = {"indexid", "index", "registro", "r", "rowid"}
+    if is_txt_source:
+        ignored_plot_columns.add("alarme")
     numeric_cols = [
         col for col in df.select_dtypes(include="number").columns
-        if not col.endswith("_dt") and col not in RAW_TIME_COLUMNS and col != "indexId"
+        if (
+            not col.endswith("_dt")
+            and col not in RAW_TIME_COLUMNS
+            and col.strip().lower() not in ignored_plot_columns
+        )
     ]
     ordered = [col for col in preferred_cols if col in numeric_cols]
     ordered.extend(col for col in numeric_cols if col not in ordered)
@@ -253,9 +347,13 @@ def render_period_filter(df: pd.DataFrame) -> pd.DataFrame:
     applied_period_key = f"applied_period_{period_key}"
 
     if applied_period_key not in st.session_state:
+        last_day = max_datetime.date()
+        last_day_df = df[df[time_col].dt.date == last_day]
+        last_day_start = last_day_df[time_col].min()
+        last_day_end = last_day_df[time_col].max()
         st.session_state[applied_period_key] = (
-            min_datetime.to_pydatetime(),
-            max_datetime.to_pydatetime(),
+            last_day_start.to_pydatetime(),
+            last_day_end.to_pydatetime(),
         )
 
     with st.container(key="filter-strip"):
@@ -308,6 +406,30 @@ def render_period_filter(df: pd.DataFrame) -> pd.DataFrame:
         applied_end_dt.date(),
         applied_end_dt.time().replace(microsecond=0),
     )
+
+
+def get_applied_period(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    time_col = get_main_time_column(df)
+    if not time_col:
+        return None
+
+    min_datetime = df[time_col].min()
+    max_datetime = df[time_col].max()
+    period_key = f"{time_col}_{len(df)}_{min_datetime.value}_{max_datetime.value}"
+    applied_period_key = f"applied_period_{period_key}"
+
+    if applied_period_key not in st.session_state:
+        last_day = max_datetime.date()
+        last_day_df = df[df[time_col].dt.date == last_day]
+        last_day_start = last_day_df[time_col].min()
+        last_day_end = last_day_df[time_col].max()
+        st.session_state[applied_period_key] = (
+            last_day_start.to_pydatetime(),
+            last_day_end.to_pydatetime(),
+        )
+
+    applied_start_dt, applied_end_dt = st.session_state[applied_period_key]
+    return pd.Timestamp(applied_start_dt), pd.Timestamp(applied_end_dt)
 
 
 def apply_custom_style() -> None:
@@ -1303,10 +1425,13 @@ def apply_custom_style() -> None:
                 font-size: 1.2rem !important;
                 background: var(--surface) !important;
             }
-            /* ---------- Layout helper: align label-less control with a labeled one ---------- */
-            .button-row-spacer {
-                height: 2.95rem;
-                line-height: 0;
+            .st-key-chart-reset-btn .stButton button {
+                width: 100% !important;
+                white-space: nowrap !important;
+            }
+            .st-key-chart-reset-btn .stButton button p,
+            .st-key-chart-reset-btn .stButton button span {
+                white-space: nowrap !important;
             }
             /* ---------- Expander: strip default chrome ---------- */
             [data-testid="stExpander"],
@@ -1387,6 +1512,21 @@ def apply_custom_style() -> None:
             .result-chip.filtered strong {
                 color: var(--accent) !important;
             }
+            .source-name-full {
+                margin-top: .4rem;
+                padding: .65rem .8rem;
+                border-radius: var(--radius-sm);
+                border: 1px solid var(--border);
+                background: var(--surface);
+                color: var(--text-muted) !important;
+                font-size: 1.02rem !important;
+                line-height: 1.35 !important;
+                word-break: break-all;
+            }
+            .source-name-full strong {
+                color: var(--text) !important;
+                font-weight: 700;
+            }
             /* ---------- Hide Streamlit deploy/menu chrome ---------- */
             [data-testid="stHeader"],
             [data-testid="stToolbar"],
@@ -1464,12 +1604,14 @@ def render_welcome_page() -> None:
     )
 
 
-def render_table_overview(df: pd.DataFrame, source_name: str) -> None:
+def render_table_overview(df: pd.DataFrame, source_name: str, source_label: str | None = None) -> None:
     time_col = get_main_time_column(df)
+    source_label_value = source_label or "-"
 
-    c1, c2, c4, c5 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Arquivo", source_name)
     c2.metric("Registros", len(df))
+    c3.metric("NAME", truncate_text(source_label_value, max_len=16))
 
     if time_col:
         try:
@@ -1481,6 +1623,13 @@ def render_table_overview(df: pd.DataFrame, source_name: str) -> None:
     else:
         c4.metric("Início", "-")
         c5.metric("Fim", "-")
+
+    if source_label_value != "-":
+        st.markdown(
+            "<div class='source-name-full'><strong>NAME completo:</strong> "
+            f"{source_label_value}</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def build_temperature_trend_areas(
@@ -1780,60 +1929,30 @@ def render_main_plot(df: pd.DataFrame, selected_columns: list[str]) -> None:
         st.session_state.chart_reset_nonce = 0
 
     total_records = len(plot_df)
-    total_pages = max(1, (total_records + CHART_PAGE_SIZE - 1) // CHART_PAGE_SIZE)
-    page_signature = (
-        total_records,
-        str(plot_df[time_col].min()),
-        str(plot_df[time_col].max()),
-        tuple(selected_columns),
+    period_df = plot_df
+    period_caption = f"Mostrando {total_records} registros no período selecionado."
+    period_token = (
+        f"{plot_df[time_col].min().strftime('%Y%m%d%H%M%S')}_"
+        f"{plot_df[time_col].max().strftime('%Y%m%d%H%M%S')}"
     )
-    page_key = "chart_page_" + str(abs(hash(page_signature)))
 
-    if st.session_state.get("chart_page_signature") != page_signature:
-        st.session_state.chart_page_signature = page_signature
-        st.session_state[page_key] = total_pages
-
-    if st.session_state.get(page_key, total_pages) > total_pages:
-        st.session_state[page_key] = total_pages
-
-    page_col, reset_col = st.columns([1, 2], gap="small")
-    with page_col:
-        if total_pages > 1:
-            current_page = st.number_input(
-                "Página do gráfico",
-                min_value=1,
-                max_value=total_pages,
-                value=st.session_state.get(page_key, total_pages),
-                step=1,
-                key=page_key,
-            )
-        else:
-            current_page = 1
-            st.caption("Mostrando todos os registros disponíveis no gráfico.")
-
-    start_idx = (int(current_page) - 1) * CHART_PAGE_SIZE
-    end_idx = min(start_idx + CHART_PAGE_SIZE, total_records)
-    page_df = plot_df.iloc[start_idx:end_idx]
-
+    caption_col, reset_col = st.columns([3, 2], gap="small")
+    with caption_col:
+        st.caption(period_caption)
     with reset_col:
-        st.markdown("<div class='button-row-spacer'></div>", unsafe_allow_html=True)
-        if st.button("Voltar gráfico ao padrão", use_container_width=True):
-            st.session_state.chart_reset_nonce += 1
-            st.rerun()
+        with st.container(key="chart-reset-btn"):
+            if st.button("Voltar gráfico ao padrão", use_container_width=True):
+                st.session_state.chart_reset_nonce += 1
+                st.rerun()
 
-    st.caption(
-        f"Mostrando registros {start_idx + 1} a {end_idx} de {total_records}. "
-        f"Cada página mostra até {CHART_PAGE_SIZE} registros."
-    )
-
-    chart_df = page_df.melt(
+    chart_df = period_df.melt(
         id_vars=time_col,
         value_vars=selected_columns,
         var_name="Medição",
         value_name="Valor",
     )
-    x_min_for_chart = page_df[time_col].min()
-    x_max_for_chart = page_df[time_col].max()
+    x_min_for_chart = period_df[time_col].min()
+    x_max_for_chart = period_df[time_col].max()
     y_values = chart_df["Valor"].dropna()
     y_scale = alt.Scale(zero=False)
     y_min_for_chart = -1.0
@@ -1849,19 +1968,19 @@ def render_main_plot(df: pd.DataFrame, selected_columns: list[str]) -> None:
 
     temperature_reference_col = "Tprincipal" if "Tprincipal" in selected_columns else selected_columns[0]
     trend_areas_df = build_temperature_trend_areas(
-        page_df,
+        period_df,
         time_col,
         temperature_reference_col,
     )
     segment_durations_df = compute_temperature_segment_durations(
-        page_df,
+        period_df,
         time_col,
         temperature_reference_col,
     )
 
     zoom_brush = alt.selection_interval(
         encodings=["x"],
-        name=f"brush_{current_page}_{st.session_state.chart_reset_nonce}",
+        name=f"brush_{period_token}_{st.session_state.chart_reset_nonce}",
         value={"x": [x_min_for_chart, x_max_for_chart]},
     )
     series_palette = ["#0d9488", "#6366f1", "#f59e0b", "#ec4899", "#14b8a6", "#8b5cf6"]
@@ -1986,31 +2105,13 @@ def render_main_plot(df: pd.DataFrame, selected_columns: list[str]) -> None:
     st.altair_chart(
         chart_with_brush,
         use_container_width=True,
-        key=f"main_chart_{current_page}_{st.session_state.chart_reset_nonce}",
+        key=f"main_chart_{period_token}_{st.session_state.chart_reset_nonce}",
     )
 
     st.caption(
         "Faixas em vermelho indicam momentos de subida de temperatura; "
         "faixas em azul indicam momentos de descida."
     )
-
-    if not segment_durations_df.empty:
-        hot_segments = segment_durations_df[segment_durations_df["Area"] == "Área quente"]
-        cold_segments = segment_durations_df[segment_durations_df["Area"] == "Área fria"]
-
-        hot_avg_seconds = hot_segments["DuracaoSegundos"].mean() if not hot_segments.empty else 0.0
-        cold_avg_seconds = cold_segments["DuracaoSegundos"].mean() if not cold_segments.empty else 0.0
-        hot_total_seconds = hot_segments["DuracaoSegundos"].sum() if not hot_segments.empty else 0.0
-        cold_total_seconds = cold_segments["DuracaoSegundos"].sum() if not cold_segments.empty else 0.0
-
-        st.caption("Média calculada no período exibido nesta página do gráfico (até 250 pontos).")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Média faixa quente", format_duration(hot_avg_seconds))
-        m2.metric("Média faixa fria", format_duration(cold_avg_seconds))
-        m3.metric("Tempo total quente", format_duration(hot_total_seconds))
-        m4.metric("Tempo total frio", format_duration(cold_total_seconds))
-    else:
-        st.caption("Não há pontos suficientes nesta página para calcular médias de faixas térmicas.")
 
 ALARM_GLYPHS = {
     "high": "▲",
@@ -2190,7 +2291,7 @@ def render_alarm_monitor(df: pd.DataFrame) -> None:
     st.markdown("".join(history_html), unsafe_allow_html=True)
 
 
-def build_report_pdf(df: pd.DataFrame, source_name: str) -> bytes:
+def build_report_pdf(df: pd.DataFrame, source_name: str, source_label: str | None = None) -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -2214,7 +2315,16 @@ def build_report_pdf(df: pd.DataFrame, source_name: str) -> bytes:
     story.append(Paragraph("Relatorio do Datalogger", styles["Title"]))
     story.append(Spacer(1, 8))
     story.append(Paragraph(f"Arquivo: {source_name}", styles["Normal"]))
+    story.append(Paragraph(f"NAME: {source_label or '-'}", styles["Normal"]))
     story.append(Paragraph(f"Total de registros: {len(df)}", styles["Normal"]))
+    time_col = get_main_time_column(df)
+    if time_col and not df.empty:
+        story.append(
+            Paragraph(
+                f"Periodo: {format_datetime(df[time_col].min())} ate {format_datetime(df[time_col].max())}",
+                styles["Normal"],
+            )
+        )
 
     temp_series = (
         pd.to_numeric(df["Tprincipal"], errors="coerce")
@@ -2249,7 +2359,6 @@ def build_report_pdf(df: pd.DataFrame, source_name: str) -> bytes:
     )
     story.append(summary_table)
 
-    time_col = get_main_time_column(df)
     if time_col and "Tprincipal" in df.columns:
         plot_df = (
             df[[time_col, "Tprincipal"]]
@@ -2350,12 +2459,53 @@ def build_report_pdf(df: pd.DataFrame, source_name: str) -> bytes:
         )
         story.append(alarm_table)
 
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Tabela de dados do periodo selecionado", styles["Heading3"]))
+    display_df = prepare_display_dataframe(df)
+    preview_df = display_df.copy()
+    if preview_df.empty:
+        story.append(Paragraph("Sem dados no periodo selecionado.", styles["Normal"]))
+    else:
+        candidate_columns = [
+            col for col in ["Data e hora", "Início", "Fim", "Tprincipal", "Setpoint", "Porta", "Alarme"]
+            if col in preview_df.columns
+        ]
+        if not candidate_columns:
+            candidate_columns = list(preview_df.columns[:6])
+
+        table_rows = [candidate_columns]
+        for _, row in preview_df[candidate_columns].iterrows():
+            table_rows.append([str(row.get(col, "-"))[:40] for col in candidate_columns])
+
+        col_width = 17.0 * cm / max(1, len(candidate_columns))
+        data_table = Table(table_rows, colWidths=[col_width] * len(candidate_columns), repeatRows=1)
+        data_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.append(data_table)
+
     doc.build(story)
     return buffer.getvalue()
 
 
 def main() -> None:
-    st.set_page_config(page_title="IoT Datalogger", layout="wide", initial_sidebar_state="collapsed")
+    favicon = str(LOGO_PATH) if LOGO_PATH.exists() else None
+    st.set_page_config(
+        page_title="IoT Datalogger",
+        page_icon=favicon,
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
 
     apply_custom_style()
     render_launcher_heartbeat()
@@ -2369,25 +2519,26 @@ def main() -> None:
         st.session_state.main_view = "Painel"
         st.session_state.reset_main_view_next_run = False
 
-    db_path = None
+    data_path = None
     df = None
     tables = []
     source_name = "-"
+    source_label = st.session_state.get("last_source_label", "-")
 
-    remembered_path = st.session_state.get("last_db_path")
+    remembered_path = st.session_state.get("last_data_path")
     if remembered_path and Path(remembered_path).exists():
-        db_path = Path(remembered_path)
-        source_name = st.session_state.get("last_source_name", db_path.name)
+        data_path = Path(remembered_path)
+        source_name = st.session_state.get("last_source_name", data_path.name)
 
-    if db_path is None and not st.session_state.get("ignore_latest_temp_db"):
-        latest = get_latest_temp_database()
+    if data_path is None and not st.session_state.get("ignore_latest_temp_db"):
+        latest = get_latest_temp_data_file()
         if latest is not None:
-            db_path = latest
+            data_path = latest
             source_name = latest.name
-            st.session_state.last_db_path = str(latest)
+            st.session_state.last_data_path = str(latest)
             st.session_state.last_source_name = source_name
 
-    if db_path is None:
+    if data_path is None:
         render_welcome_page()
         uploaded_file = st.file_uploader(
             "Importar arquivo de dados",
@@ -2397,8 +2548,9 @@ def main() -> None:
             try:
                 temp_path, uploaded_name = save_uploaded_database(uploaded_file)
                 st.session_state.ignore_latest_temp_db = False
-                st.session_state.last_db_path = str(temp_path)
+                st.session_state.last_data_path = str(temp_path)
                 st.session_state.last_source_name = uploaded_name
+                st.session_state.last_source_label = "-"
                 st.success("Arquivo importado com sucesso.")
                 st.rerun()
             except Exception as e:
@@ -2406,18 +2558,19 @@ def main() -> None:
         st.stop()
         return
 
-    # Lista tabelas
-    try:
-        tables = list_tables(str(db_path))
-    except Exception as e:
-        st.error(f"Não consegui abrir o arquivo de dados: {e}")
-        st.stop()
-        return
+    selected_table = "TXT"
+    if data_path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+        try:
+            tables = list_tables(str(data_path))
+        except Exception as e:
+            st.error(f"Não consegui abrir o arquivo de dados: {e}")
+            st.stop()
+            return
 
-    if not tables:
-        st.error("Não encontramos dados para exibir neste arquivo.")
-        st.stop()
-        return
+        if not tables:
+            st.error("Não encontramos dados para exibir neste arquivo.")
+            st.stop()
+            return
 
     with st.container(key="sticky_header_menu"):
         with st.container(key="header-inner"):
@@ -2433,20 +2586,28 @@ def main() -> None:
             )
 
     if active_view == "Submeter novos dados":
-        st.session_state.pop("last_db_path", None)
+        st.session_state.pop("last_data_path", None)
         st.session_state.pop("last_source_name", None)
+        st.session_state.pop("last_source_label", None)
         st.session_state.ignore_latest_temp_db = True
         st.session_state.file_uploader_nonce = st.session_state.get("file_uploader_nonce", 0) + 1
         st.session_state.reset_main_view_next_run = True
         st.rerun()
 
-    default_table = "DataGrpData" if "DataGrpData" in tables else tables[0]
-    selected_table = default_table
-
-    # Lê tabela
     try:
-        raw_df = read_table(str(db_path), selected_table)
-        df = normalize_dataframe(raw_df)
+        if data_path.suffix.lower() == ".txt":
+            raw_df, parsed_name = parse_datalogger_txt(str(data_path))
+            source_label = parsed_name
+            st.session_state.last_source_label = source_label
+            df = normalize_dataframe(raw_df)
+        else:
+            default_table = "DataGrpData" if "DataGrpData" in tables else tables[0]
+            selected_table = default_table
+            raw_df = read_table(str(data_path), selected_table)
+            df = normalize_dataframe(raw_df)
+            if "last_source_label" not in st.session_state:
+                st.session_state.last_source_label = "-"
+            source_label = st.session_state.get("last_source_label", "-")
     except Exception as e:
         st.error(f"Não consegui ler o grupo de dados '{selected_table}': {e}")
         st.stop()
@@ -2458,7 +2619,7 @@ def main() -> None:
         return
 
     if active_view == "Painel":
-        render_table_overview(df, source_name)
+        render_table_overview(df, source_name, source_label=source_label)
         filtered_df = render_period_filter(df)
         if filtered_df.empty:
             st.warning("Não há dados para mostrar no período selecionado.")
@@ -2491,7 +2652,10 @@ def main() -> None:
             else:
                 k4.metric("Menor temperatura", "-")
 
-        plot_columns = get_preferred_plot_columns(filtered_df)
+        plot_columns = get_preferred_plot_columns(
+            filtered_df,
+            is_txt_source=(data_path.suffix.lower() == ".txt"),
+        )
         default_plot_columns = [
             col for col in ["Tprincipal", "Setpoint"]
             if col in plot_columns
@@ -2543,7 +2707,19 @@ def main() -> None:
                 disabled=display_df.empty,
             )
         with report_col:
-            report_pdf = build_report_pdf(df, source_name)
+            period_bounds = get_applied_period(df)
+            period_df_for_report = df
+            if period_bounds is not None:
+                start_dt, end_dt = period_bounds
+                period_df_for_report = filter_by_period(
+                    df,
+                    start_dt.date(),
+                    start_dt.time().replace(microsecond=0),
+                    end_dt.date(),
+                    end_dt.time().replace(microsecond=0),
+                )
+
+            report_pdf = build_report_pdf(period_df_for_report, source_name, source_label=source_label)
             source_stem = Path(source_name).stem if source_name else "arquivo"
             st.download_button(
                 "Gerar Relatório",
