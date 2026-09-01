@@ -19,8 +19,8 @@ temp/
 run_error.log
 run_runtime.log
 
-# Generated icon (rebuilt from img/logo2026.png by the build script)
-img/logo2026.ico
+# Generated icon (rebuilt from img/icon_transparent.png by the build script)
+img/icon.ico
 
 # Editor / tooling scratch
 .agents/

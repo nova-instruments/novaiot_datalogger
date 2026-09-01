@@ -13,7 +13,7 @@ $targets = @(
     '.codex',
     'run_error.log',
     'run_runtime.log',
-    'img\logo2026.ico',
+    'img\icon.ico',
     'novaview_datalogger_logo.png'
 )
 
