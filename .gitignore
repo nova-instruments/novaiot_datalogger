@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller build output
+build/
+dist/
+*.manifest
+
+# App runtime / local data
+.runtime_home/
+temp/
+*.db
+*.sqlite
+*.sqlite3
+run_error.log
+run_runtime.log
+
+# Generated icon (rebuilt from img/logo2026.png by the build script)
+img/logo2026.ico
+
+# Editor / tooling scratch
+.agents/
+.codex/
+.DS_Store

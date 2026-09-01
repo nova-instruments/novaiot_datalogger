@@ -1,7 +1,9 @@
 import base64
 import os
+import re
 import sqlite3
 import sys
+import string
 from io import BytesIO
 from pathlib import Path
 
@@ -26,7 +28,7 @@ def _get_app_base_dir() -> Path:
 def _get_data_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         local_appdata = os.environ.get("LOCALAPPDATA")
-        base_dir = Path(local_appdata) / "NovaIoT" if local_appdata else Path.home() / ".novaiot"
+        base_dir = Path(local_appdata) / "NovaView" if local_appdata else Path.home() / ".novaview"
     else:
         base_dir = Path(__file__).resolve().parent
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -38,9 +40,10 @@ DATA_BASE_DIR = _get_data_base_dir()
 TEMP_DIR = DATA_BASE_DIR / "temp"
 
 TIMEZONE = "America/Sao_Paulo"
-LOGO_PATH = APP_BASE_DIR / "img" / "logo2026.png"
+LOGO_PATH = APP_BASE_DIR / "img" / "novaview_datalogger_logo.png"
 TEMP_HIGH_ALARM_LIMIT = 8
 TEMP_LOW_ALARM_LIMIT = 1
+TEMP_LOW_ALARM_LIMIT_TXT = 2
 RAW_TIME_COLUMNS = ["CollectTime", "StartTime", "EndTime", "Timestamp", "Time"]
 DISPLAY_TIME_COLUMNS = {
     "CollectTime_dt": "Data e hora",
@@ -98,6 +101,64 @@ def render_launcher_heartbeat() -> None:
     )
 
 
+def render_locale_text_patches() -> None:
+    """Traduz textos nativos do widget de upload do Streamlit (embutidos no JS
+    do framework, sem parâmetro Python para customização) para PT-BR."""
+    components.html(
+        r"""
+        <script>
+        (() => {
+            const parentDoc = window.parent.document;
+            const replacements = [
+                [/^Upload directories$/, "Importar"],
+                [/^Upload$/, "Importar"],
+                [/^Drag and drop directories here$/, "Arraste os arquivos da pasta aqui"],
+                [/^Drag and drop files here$/, "Arraste os arquivos aqui"],
+                [/^Drag and drop a file here$/, "Arraste o arquivo aqui"],
+                [/^([\d.]+\s?(?:B|KB|MB|GB)) per file$/, "$1 por arquivo"],
+            ];
+
+            const patch = (node) => {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    const text = node.nodeValue.trim();
+                    if (!text) return;
+                    for (const [pattern, replacement] of replacements) {
+                        if (pattern.test(text)) {
+                            node.nodeValue = node.nodeValue.replace(pattern, replacement);
+                            return;
+                        }
+                    }
+                } else if (node.childNodes) {
+                    node.childNodes.forEach(patch);
+                }
+            };
+
+            const scan = () => {
+                try {
+                    patch(parentDoc.body);
+                } catch (e) {
+                    /* iframe ainda sem acesso ao parent nesse instante */
+                }
+            };
+
+            scan();
+            try {
+                new MutationObserver(scan).observe(parentDoc.body, {
+                    childList: true,
+                    subtree: true,
+                    characterData: true,
+                });
+            } catch (e) {
+                /* ignora se o parent ainda nao estiver pronto */
+            }
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def is_running_in_streamlit_runtime() -> bool:
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -106,24 +167,161 @@ def is_running_in_streamlit_runtime() -> bool:
         return False
 
 
-def get_latest_temp_data_file() -> Path | None:
-    if not TEMP_DIR.exists():
-        return None
-
-    data_files = [
-        path for path in TEMP_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() in {".db", ".sqlite", ".sqlite3", ".txt"}
-    ]
-    if not data_files:
-        return None
-    return max(data_files, key=lambda path: path.stat().st_mtime)
-
-
 def save_uploaded_database(uploaded_file) -> tuple[Path, str]:
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    temp_path = TEMP_DIR / uploaded_file.name
+    safe_name = Path(uploaded_file.name).name
+    temp_path = TEMP_DIR / safe_name
     temp_path.write_bytes(uploaded_file.getbuffer())
-    return temp_path, uploaded_file.name
+    return temp_path, safe_name
+
+
+def save_uploaded_ihm_databases(uploaded_files) -> list[Path]:
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    ihm_temp_dir = TEMP_DIR / "ihm_uploads"
+    ihm_temp_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[Path] = []
+    for idx, uploaded_file in enumerate(uploaded_files):
+        relative_name = str(uploaded_file.name).replace("\\", "/")
+        relative_lower = relative_name.lower()
+        if "/datalogfile/" not in f"/{relative_lower}" and not relative_lower.startswith("datalogfile/"):
+            continue
+        if not relative_lower.endswith(".db"):
+            continue
+
+        original_name = Path(relative_name).name
+        safe_name = f"{idx:04d}_{original_name}"
+        temp_path = ihm_temp_dir / safe_name
+        temp_path.write_bytes(uploaded_file.getbuffer())
+        saved_paths.append(temp_path)
+    return saved_paths
+
+
+def extract_ihm_db_upload_entries(uploaded_files) -> list[str]:
+    entries: list[str] = []
+    for uploaded_file in uploaded_files:
+        relative_name = str(uploaded_file.name).replace("\\", "/")
+        relative_lower = relative_name.lower()
+        if "/datalogfile/" not in f"/{relative_lower}" and not relative_lower.startswith("datalogfile/"):
+            continue
+        if not relative_lower.endswith(".db"):
+            continue
+        entries.append(relative_name)
+    return entries
+
+
+def build_ihm_upload_metadata(uploaded_files) -> tuple[str, str]:
+    entries = extract_ihm_db_upload_entries(uploaded_files)
+    if not entries:
+        return "-", "-"
+
+    base_names = [Path(entry).name for entry in entries]
+    first_stem = Path(base_names[0]).stem
+    source_name = first_stem.rsplit("_", 1)[0] if "_" in first_stem else first_stem
+
+    chunk_numbers: list[int] = []
+    for name in base_names:
+        stem = Path(name).stem
+        chunk_numbers.append(parse_chunk_index_from_stem(stem))
+
+    if not chunk_numbers:
+        return source_name, "-"
+
+    # Exibição amigável solicitada: _0 vira banco 1, _7 vira banco 8.
+    min_bank = min(chunk_numbers) + 1
+    max_bank = max(chunk_numbers) + 1
+    if min_bank == max_bank:
+        source_label = str(min_bank)
+    else:
+        source_label = f"{min_bank}-{max_bank}"
+
+    return source_name, source_label
+
+
+def parse_chunk_index_from_stem(stem: str) -> int:
+    if "_" not in stem:
+        return 0
+    tail = stem.rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
+def resolve_ihm_datalog_dir(base_path: str | Path) -> Path:
+    root = Path(base_path).expanduser().resolve()
+    data_log_dir = root / "DataLogFile"
+    if data_log_dir.exists() and data_log_dir.is_dir():
+        return data_log_dir
+    return root
+
+
+def list_ihm_db_files(base_path: str | Path) -> list[Path]:
+    data_log_dir = resolve_ihm_datalog_dir(base_path)
+    if not data_log_dir.exists() or not data_log_dir.is_dir():
+        return []
+
+    db_files = [
+        p for p in data_log_dir.rglob("*.db")
+        if p.is_file()
+    ]
+    db_files.sort(key=lambda p: (str(p.parent), parse_chunk_index_from_stem(p.stem), p.name.lower()))
+    return db_files
+
+
+def list_removable_drive_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    if os.name == "nt":
+        for letter in string.ascii_uppercase:
+            drive = Path(f"{letter}:/")
+            if drive.exists() and drive.is_dir():
+                candidates.append(drive)
+    else:
+        def safe_list_dirs(base: Path) -> list[Path]:
+            try:
+                entries = list(base.iterdir())
+            except (PermissionError, OSError):
+                return []
+            out: list[Path] = []
+            for e in entries:
+                try:
+                    if e.is_dir():
+                        out.append(e)
+                except (PermissionError, OSError):
+                    continue
+            return out
+
+        for root in [Path("/media"), Path("/run/media"), Path("/Volumes"), Path("/mnt")]:
+            try:
+                if not root.exists() or not root.is_dir():
+                    continue
+            except (PermissionError, OSError):
+                continue
+            # Busca rasa e segura: somente pontos de montagem prováveis
+            # Ex.: /media/<user>/<label>, /run/media/<user>/<label>, /mnt/<label>
+            first_level = safe_list_dirs(root)
+            candidates.extend(first_level)
+            for level1 in first_level:
+                candidates.extend(safe_list_dirs(level1))
+
+    unique: list[Path] = []
+    seen = set()
+    for p in candidates:
+        try:
+            key = str(p.resolve())
+        except (PermissionError, OSError):
+            continue
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
+
+
+def discover_ihm_root_from_removable() -> list[tuple[Path, Path]]:
+    matches: list[tuple[Path, Path]] = []
+    for mount in list_removable_drive_candidates():
+        data_log_dir = mount / "DataLogFile"
+        if data_log_dir.exists() and data_log_dir.is_dir():
+            matches.append((mount, data_log_dir))
+    return matches
 
 
 def normalize_time_fragment(time_fragment: str) -> str:
@@ -134,6 +332,7 @@ def normalize_time_fragment(time_fragment: str) -> str:
     return f"{hh.zfill(2)}:{mm.zfill(2)}:{ss.zfill(2)}"
 
 
+@st.cache_data(show_spinner=False)
 def parse_datalogger_txt(txt_path: str) -> tuple[pd.DataFrame, str]:
     text = Path(txt_path).read_text(encoding="utf-8", errors="replace")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -190,11 +389,48 @@ def parse_datalogger_txt(txt_path: str) -> tuple[pd.DataFrame, str]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if "Porta" in df.columns:
-        porta_series = pd.to_numeric(df["Porta"], errors="coerce").fillna(0)
-        df["Alarme"] = (porta_series == 1).astype(int)
+    df = apply_alarm_rules(df, high_limit=TEMP_HIGH_ALARM_LIMIT, low_limit=TEMP_LOW_ALARM_LIMIT_TXT)
 
     return df, name_value
+
+
+def extract_txt_device_name(name_value: str, fallback: str = "arquivo") -> str:
+    text = str(name_value or "").strip()
+    if not text or text == "-":
+        return fallback
+
+    matches = re.findall(r"\b([A-Z]{2,}\d+(?:-\d+)?)\b", text)
+    if matches:
+        return matches[-1]
+
+    base_name = Path(text.replace("\\", "/")).stem.strip()
+    return base_name or fallback
+
+
+@st.cache_data(show_spinner=False)
+def apply_alarm_rules(
+    df: pd.DataFrame,
+    high_limit: float = TEMP_HIGH_ALARM_LIMIT,
+    low_limit: float = TEMP_LOW_ALARM_LIMIT,
+) -> pd.DataFrame:
+    out = df.copy()
+    porta_series = (
+        pd.to_numeric(out["Porta"], errors="coerce").fillna(0)
+        if "Porta" in out.columns
+        else pd.Series(index=out.index, data=0, dtype="float64")
+    )
+    temp_series = (
+        pd.to_numeric(out["Tprincipal"], errors="coerce")
+        if "Tprincipal" in out.columns
+        else pd.Series(index=out.index, data=float("nan"), dtype="float64")
+    )
+    alarm_mask = (
+        (porta_series == 1)
+        | (temp_series > high_limit)
+        | (temp_series < low_limit)
+    )
+    out["Alarme"] = alarm_mask.astype(int)
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -212,6 +448,46 @@ def read_table(db_path: str, table_name: str) -> pd.DataFrame:
         return pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
 
 
+@st.cache_data(show_spinner=False)
+def list_tables_from_many_databases(db_paths: tuple[str, ...]) -> list[str]:
+    table_names: set[str] = set()
+    failed_names: list[str] = []
+    for db_path in db_paths:
+        try:
+            table_names.update(list_tables(db_path))
+        except Exception:
+            failed_names.append(Path(db_path).name)
+    if failed_names:
+        st.warning(
+            f"Não foi possível ler {len(failed_names)} arquivo(s) de banco de dados "
+            f"(ignorado(s)): {', '.join(failed_names)}"
+        )
+    return sorted(table_names)
+
+
+@st.cache_data(show_spinner=False)
+def read_table_from_many_databases(db_paths: tuple[str, ...], table_name: str) -> pd.DataFrame:
+    chunks: list[pd.DataFrame] = []
+    failed_names: list[str] = []
+    for db_path in db_paths:
+        try:
+            chunk = read_table(db_path, table_name)
+            if not chunk.empty:
+                chunks.append(chunk)
+        except Exception:
+            failed_names.append(Path(db_path).name)
+    if failed_names:
+        st.warning(
+            f"Não foi possível ler {len(failed_names)} arquivo(s) de banco de dados "
+            f"(dados parciais): {', '.join(failed_names)}"
+        )
+
+    if not chunks:
+        return pd.DataFrame()
+    return pd.concat(chunks, ignore_index=True, sort=False)
+
+
+@st.cache_data(show_spinner=False)
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
@@ -241,6 +517,14 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                     pass
 
     return out
+
+
+def coerce_float(value, default: float = float("nan")) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if pd.isna(result) else result
 
 
 def format_metric(value) -> str:
@@ -310,7 +594,22 @@ def prepare_display_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if raw_col in display_df.columns and converted_col in display_df.columns:
             display_df = display_df.drop(columns=[raw_col])
 
-    return display_df.rename(columns=DISPLAY_TIME_COLUMNS)
+    display_df = display_df.rename(
+        columns={
+            **DISPLAY_TIME_COLUMNS,
+            "IndexID": "indexID",
+            "Setpoint": "setpoint",
+            "Alarme": "alarme",
+            "Porta": "porta",
+        }
+    )
+
+    preferred_order = [
+        "indexID", "Data e hora", "Tprincipal", "Degelo", "setpoint", "Tomada", "Bateria", "alarme", "porta",
+    ]
+    ordered_cols = [col for col in preferred_order if col in display_df.columns]
+    ordered_cols.extend(col for col in display_df.columns if col not in ordered_cols)
+    return display_df.loc[:, ordered_cols]
 
 
 def filter_by_period(
@@ -333,7 +632,12 @@ def filter_by_period(
         st.warning("A data/hora inicial precisa ser menor que a data/hora final.")
         return df.iloc[0:0]
 
-    return df[(df[time_col] >= start_dt) & (df[time_col] <= end_dt)]
+    # end_time só tem precisão de segundos (widget de hora), mas os timestamps dos
+    # dataloggers têm precisão de milissegundos. Um limite "<=" exato no segundo
+    # descartaria qualquer leitura com fração de segundo naquele instante — por
+    # isso o limite superior é exclusivo no início do próximo segundo.
+    end_dt_exclusive = end_dt + pd.Timedelta(seconds=1)
+    return df[(df[time_col] >= start_dt) & (df[time_col] < end_dt_exclusive)]
 
 
 def render_period_filter(df: pd.DataFrame) -> pd.DataFrame:
@@ -347,13 +651,12 @@ def render_period_filter(df: pd.DataFrame) -> pd.DataFrame:
     applied_period_key = f"applied_period_{period_key}"
 
     if applied_period_key not in st.session_state:
-        last_day = max_datetime.date()
-        last_day_df = df[df[time_col].dt.date == last_day]
-        last_day_start = last_day_df[time_col].min()
-        last_day_end = last_day_df[time_col].max()
+        # Janela padrão: últimas 24h de dados (não o dia calendário), para não
+        # cair num período quase vazio quando o dia mais recente acabou de começar.
+        default_start = max(max_datetime - pd.Timedelta(hours=24), min_datetime)
         st.session_state[applied_period_key] = (
-            last_day_start.to_pydatetime(),
-            last_day_end.to_pydatetime(),
+            default_start.to_pydatetime(),
+            max_datetime.to_pydatetime(),
         )
 
     with st.container(key="filter-strip"):
@@ -419,13 +722,12 @@ def get_applied_period(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp] | 
     applied_period_key = f"applied_period_{period_key}"
 
     if applied_period_key not in st.session_state:
-        last_day = max_datetime.date()
-        last_day_df = df[df[time_col].dt.date == last_day]
-        last_day_start = last_day_df[time_col].min()
-        last_day_end = last_day_df[time_col].max()
+        # Janela padrão: últimas 24h de dados (não o dia calendário), para não
+        # cair num período quase vazio quando o dia mais recente acabou de começar.
+        default_start = max(max_datetime - pd.Timedelta(hours=24), min_datetime)
         st.session_state[applied_period_key] = (
-            last_day_start.to_pydatetime(),
-            last_day_end.to_pydatetime(),
+            default_start.to_pydatetime(),
+            max_datetime.to_pydatetime(),
         )
 
     applied_start_dt, applied_end_dt = st.session_state[applied_period_key]
@@ -791,9 +1093,56 @@ def apply_custom_style() -> None:
                 border-radius: var(--radius);
                 overflow: hidden;
             }
-            div[data-testid="stDataFrame"] *,
-            div[data-testid="stTable"] * {
-                font-size: 1.35rem !important;
+            .data-complete-table {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                max-height: calc(100vh - 30rem);
+                overflow: auto;
+                scrollbar-gutter: stable;
+                max-width: 100%;
+            }
+            .data-complete-table::-webkit-scrollbar {
+                width: 14px;
+                height: 14px;
+            }
+            .data-complete-table::-webkit-scrollbar-track {
+                background: var(--surface-2);
+                border-radius: var(--radius-pill);
+            }
+            .data-complete-table::-webkit-scrollbar-thumb {
+                background: var(--border-strong);
+                border-radius: var(--radius-pill);
+                border: 3px solid var(--surface-2);
+            }
+            .data-complete-table::-webkit-scrollbar-thumb:hover {
+                background: var(--text-muted);
+            }
+            .data-complete-table table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 1.8375rem;
+                line-height: 1.35;
+            }
+            .data-complete-table thead th {
+                position: sticky;
+                top: 0;
+                z-index: 1;
+                background: var(--surface-2);
+                color: var(--text);
+                font-weight: 800;
+                text-align: left;
+                padding: .75rem 1rem;
+                border-bottom: 2px solid var(--border-strong);
+            }
+            .data-complete-table tbody td {
+                color: var(--text);
+                padding: .7rem 1rem;
+                border-bottom: 1px solid var(--border);
+                vertical-align: top;
+            }
+            .data-complete-table tbody tr:hover {
+                background: color-mix(in srgb, var(--accent) 8%, transparent);
             }
             .app-hero {
                 background: transparent;
@@ -853,7 +1202,7 @@ def apply_custom_style() -> None:
                 gap: 1.25rem;
             }
             .app-logo {
-                height: 2.4rem;
+                height: 3rem;
                 width: auto;
                 flex: 0 0 auto;
             }
@@ -1159,6 +1508,42 @@ def apply_custom_style() -> None:
                 height: 1.5rem;
                 background: var(--primary);
                 border-radius: var(--radius-pill);
+            }
+            .data-complete-source-title {
+                color: var(--primary) !important;
+                font-size: 6.75rem !important;
+                font-weight: 800 !important;
+                letter-spacing: -0.02em;
+                line-height: 1.05 !important;
+                margin: .5rem 0 .35rem 0 !important;
+            }
+            .data-complete-range {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 1rem;
+                margin: .25rem 0 1rem 0;
+            }
+            .data-complete-range-card {
+                flex: 1 1 320px;
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                padding: .9rem 1rem;
+                box-shadow: var(--shadow-sm);
+            }
+            .data-complete-range-label {
+                color: var(--text-muted) !important;
+                font-size: 1.05rem !important;
+                font-weight: 700 !important;
+                text-transform: uppercase;
+                letter-spacing: .04em;
+                margin-bottom: .35rem;
+            }
+            .data-complete-range-value {
+                color: var(--text) !important;
+                font-size: 1.45rem !important;
+                font-weight: 700 !important;
+                line-height: 1.25;
             }
             div[data-baseweb="tab-list"] {
                 gap: 14px;
@@ -1571,12 +1956,11 @@ def apply_custom_style() -> None:
 
 def render_header() -> None:
     logo_uri = get_logo_data_uri(str(LOGO_PATH))
-    logo_html = f'<img class="app-logo" src="{logo_uri}" alt="Logo">' if logo_uri else ""
+    logo_html = f'<img class="app-logo" src="{logo_uri}" alt="NovaView Datalogger">' if logo_uri else ""
     st.markdown(
         f"""
             <div class="app-hero app-header">
                 {logo_html}
-                <h1>IoT Datalogger</h1>
             </div>
         """,
         unsafe_allow_html=True,
@@ -1585,15 +1969,15 @@ def render_header() -> None:
 
 def render_welcome_page() -> None:
     logo_uri = get_logo_data_uri(str(LOGO_PATH))
-    logo_html = f'<img class="welcome-logo" src="{logo_uri}" alt="Logo">' if logo_uri else ""
+    logo_html = f'<img class="welcome-logo" src="{logo_uri}" alt="NovaView Datalogger">' if logo_uri else ""
     st.markdown(
         f"""
             <div class="welcome-card">
                 {logo_html}
-                <h1>Bem-vindo ao IoT Datalogger</h1>
-                <p>Importe o banco de dados do datalogger para visualizar medições, alarmes e histórico completo.</p>
+                <h1>Bem-vindo ao NovaView Datalogger</h1>
+                <p>Importe um arquivo de dados ou selecione a pasta da IHM para visualizar medições, alarmes e histórico completo.</p>
                 <ul class="welcome-features">
-                    <li>Indicadores e gráficos das medições em tempo real</li>
+                    <li>Indicadores e gráficos das medições</li>
                     <li>Monitor de alarmes com histórico classificado</li>
                     <li>Exportação dos dados completos para Excel ou PDF</li>
                 </ul>
@@ -1602,6 +1986,23 @@ def render_welcome_page() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_ihm_db_uploader(upload_key: str):
+    try:
+        return st.file_uploader(
+            "Selecione a pasta raiz da IHM",
+            accept_multiple_files="directory",
+            key=f"{upload_key}_directory",
+            help="Selecione a pasta do pendrive. O sistema consolida automaticamente _0, _1, _2...",
+        )
+    except Exception:
+        return st.file_uploader(
+            "Selecione os arquivos .db da IHM (_0, _1, _2...)",
+            accept_multiple_files=True,
+            key=f"{upload_key}_files",
+            help="Sua versão não suporta seleção direta de pasta. Selecione os .db manualmente.",
+        )
 
 
 def render_table_overview(df: pd.DataFrame, source_name: str, source_label: str | None = None) -> None:
@@ -2030,7 +2431,11 @@ def render_main_plot(df: pd.DataFrame, selected_columns: list[str]) -> None:
             ),
             y=alt.Y("Valor:Q", scale=y_scale),
             color=alt.Color("Medição:N", scale=alt.Scale(range=series_palette), legend=None),
-            opacity=alt.condition(hover_selection, alt.value(1), alt.value(0)),
+            opacity=(
+                alt.value(1)
+                if total_records <= 1
+                else alt.condition(hover_selection, alt.value(1), alt.value(0))
+            ),
             tooltip=[
                 alt.Tooltip(f"{time_col}:T", title="Data e hora", format="%d/%m/%Y %H:%M:%S"),
                 alt.Tooltip("Medição:N", title="Medição"),
@@ -2127,18 +2532,18 @@ ALARM_LABELS = {
 }
 
 
-def alarm_kind(temperature, door) -> str:
+def alarm_kind(temperature, door, high_limit: float = TEMP_HIGH_ALARM_LIMIT, low_limit: float = TEMP_LOW_ALARM_LIMIT) -> str:
     if door == 1:
         return "door"
-    if pd.notna(temperature) and temperature > TEMP_HIGH_ALARM_LIMIT:
+    if pd.notna(temperature) and temperature > high_limit:
         return "high"
-    if pd.notna(temperature) and temperature < TEMP_LOW_ALARM_LIMIT:
+    if pd.notna(temperature) and temperature < low_limit:
         return "low"
     return "generic"
 
 
-def classify_alarm(temperature, door) -> str:
-    return ALARM_LABELS[alarm_kind(temperature, door)]
+def classify_alarm(temperature, door, high_limit: float = TEMP_HIGH_ALARM_LIMIT, low_limit: float = TEMP_LOW_ALARM_LIMIT) -> str:
+    return ALARM_LABELS[alarm_kind(temperature, door, high_limit=high_limit, low_limit=low_limit)]
 
 
 def render_empty_state(title: str, body: str, glyph: str = "✓") -> None:
@@ -2154,7 +2559,11 @@ def render_empty_state(title: str, body: str, glyph: str = "✓") -> None:
     )
 
 
-def render_alarm_monitor(df: pd.DataFrame) -> None:
+def render_alarm_monitor(
+    df: pd.DataFrame,
+    high_limit: float = TEMP_HIGH_ALARM_LIMIT,
+    low_limit: float = TEMP_LOW_ALARM_LIMIT,
+) -> None:
     st.subheader("Monitor de alarmes")
 
     if "Alarme" not in df.columns:
@@ -2186,8 +2595,8 @@ def render_alarm_monitor(df: pd.DataFrame) -> None:
         else pd.Series(index=alarm_df.index, dtype="float64")
     )
 
-    high_temp_mask = temperature > TEMP_HIGH_ALARM_LIMIT
-    low_temp_mask = temperature < TEMP_LOW_ALARM_LIMIT
+    high_temp_mask = temperature > high_limit
+    low_temp_mask = temperature < low_limit
     door_open_mask = door == 1
 
     a1, a2, a3, a4 = st.columns(4)
@@ -2205,7 +2614,7 @@ def render_alarm_monitor(df: pd.DataFrame) -> None:
     latest_alarm = alarm_df.iloc[-1]
     latest_temp = pd.to_numeric(pd.Series([latest_alarm.get("Tprincipal")]), errors="coerce").iloc[0]
     latest_door = pd.to_numeric(pd.Series([latest_alarm.get("Porta")]), errors="coerce").fillna(0).iloc[0]
-    latest_kind = alarm_kind(latest_temp, latest_door)
+    latest_kind = alarm_kind(latest_temp, latest_door, high_limit=high_limit, low_limit=low_limit)
     latest_label = ALARM_LABELS[latest_kind]
     latest_glyph = ALARM_GLYPHS[latest_kind]
 
@@ -2273,9 +2682,9 @@ def render_alarm_monitor(df: pd.DataFrame) -> None:
         "</div>",
     ]
     for _, row in alarm_df.tail(200).iloc[::-1].iterrows():
-        row_temp = pd.to_numeric(pd.Series([row.get("Tprincipal")]), errors="coerce").iloc[0]
-        row_door = pd.to_numeric(pd.Series([row.get("Porta")]), errors="coerce").fillna(0).iloc[0]
-        row_kind = alarm_kind(row_temp, row_door)
+        row_temp = coerce_float(row.get("Tprincipal"))
+        row_door = coerce_float(row.get("Porta"), default=0.0)
+        row_kind = alarm_kind(row_temp, row_door, high_limit=high_limit, low_limit=low_limit)
         when = format_datetime(row.get(time_col)) if time_col else "-"
         glyph = ALARM_GLYPHS[row_kind]
         label = ALARM_LABELS[row_kind].replace("Alarme de ", "").capitalize()
@@ -2291,7 +2700,21 @@ def render_alarm_monitor(df: pd.DataFrame) -> None:
     st.markdown("".join(history_html), unsafe_allow_html=True)
 
 
-def build_report_pdf(df: pd.DataFrame, source_name: str, source_label: str | None = None) -> bytes:
+@st.cache_data(show_spinner=False)
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    excel_buffer = BytesIO()
+    df.to_excel(excel_buffer, index=False, sheet_name="Dados")
+    return excel_buffer.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def build_report_pdf(
+    df: pd.DataFrame,
+    source_name: str,
+    source_label: str | None = None,
+    high_limit: float = TEMP_HIGH_ALARM_LIMIT,
+    low_limit: float = TEMP_LOW_ALARM_LIMIT,
+) -> bytes:
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -2432,13 +2855,13 @@ def build_report_pdf(df: pd.DataFrame, source_name: str, source_label: str | Non
     else:
         rows = [["Data e hora", "Tipo", "Temperatura", "Porta"]]
         for _, row in alarm_df.tail(10).iloc[::-1].iterrows():
-            row_temp = pd.to_numeric(pd.Series([row.get("Tprincipal")]), errors="coerce").iloc[0]
-            row_door = pd.to_numeric(pd.Series([row.get("Porta")]), errors="coerce").fillna(0).iloc[0]
+            row_temp = coerce_float(row.get("Tprincipal"))
+            row_door = coerce_float(row.get("Porta"), default=0.0)
             when = format_datetime(row.get(time_col)) if time_col else "-"
             rows.append(
                 [
                     when,
-                    classify_alarm(row_temp, row_door),
+                    classify_alarm(row_temp, row_door, high_limit=high_limit, low_limit=low_limit),
                     format_metric(row_temp),
                     format_metric(row_door),
                 ]
@@ -2466,16 +2889,37 @@ def build_report_pdf(df: pd.DataFrame, source_name: str, source_label: str | Non
     if preview_df.empty:
         story.append(Paragraph("Sem dados no periodo selecionado.", styles["Normal"]))
     else:
+        max_report_rows = 5000
+        if len(preview_df) > max_report_rows:
+            story.append(
+                Paragraph(
+                    f"Mostrando os ultimos {max_report_rows:,} de {len(preview_df):,} registros.".replace(",", "."),
+                    styles["Normal"],
+                )
+            )
+            preview_df = preview_df.tail(max_report_rows)
+
         candidate_columns = [
-            col for col in ["Data e hora", "Início", "Fim", "Tprincipal", "Setpoint", "Porta", "Alarme"]
+            col for col in [
+                "Data e hora", "Início", "Fim", "Tprincipal", "Degelo",
+                "setpoint", "Tomada", "Bateria", "alarme", "porta",
+            ]
             if col in preview_df.columns
         ]
         if not candidate_columns:
             candidate_columns = list(preview_df.columns[:6])
 
-        table_rows = [candidate_columns]
-        for _, row in preview_df[candidate_columns].iterrows():
-            table_rows.append([str(row.get(col, "-"))[:40] for col in candidate_columns])
+        report_column_labels = {
+            "Data e hora": "Data e Hora",
+            "setpoint": "SetPoint",
+            "alarme": "Alarme",
+            "porta": "Porta",
+        }
+        header_row = [report_column_labels.get(col, col) for col in candidate_columns]
+
+        table_rows = [header_row]
+        for row in preview_df[candidate_columns].itertuples(index=False):
+            table_rows.append([str(value)[:40] for value in row])
 
         col_width = 17.0 * cm / max(1, len(candidate_columns))
         data_table = Table(table_rows, colWidths=[col_width] * len(candidate_columns), repeatRows=1)
@@ -2501,7 +2945,7 @@ def build_report_pdf(df: pd.DataFrame, source_name: str, source_label: str | Non
 def main() -> None:
     favicon = str(LOGO_PATH) if LOGO_PATH.exists() else None
     st.set_page_config(
-        page_title="IoT Datalogger",
+        page_title="NovaView Datalogger",
         page_icon=favicon,
         layout="wide",
         initial_sidebar_state="collapsed",
@@ -2509,6 +2953,7 @@ def main() -> None:
 
     apply_custom_style()
     render_launcher_heartbeat()
+    render_locale_text_patches()
 
     if "file_uploader_nonce" not in st.session_state:
         st.session_state.file_uploader_nonce = 0
@@ -2520,25 +2965,26 @@ def main() -> None:
         st.session_state.reset_main_view_next_run = False
 
     data_path = None
+    data_db_paths: tuple[str, ...] = tuple()
     df = None
     tables = []
     source_name = "-"
     source_label = st.session_state.get("last_source_label", "-")
+    source_mode = st.session_state.get("last_data_mode", "single_file")
 
     remembered_path = st.session_state.get("last_data_path")
     if remembered_path and Path(remembered_path).exists():
         data_path = Path(remembered_path)
         source_name = st.session_state.get("last_source_name", data_path.name)
 
-    if data_path is None and not st.session_state.get("ignore_latest_temp_db"):
-        latest = get_latest_temp_data_file()
-        if latest is not None:
-            data_path = latest
-            source_name = latest.name
-            st.session_state.last_data_path = str(latest)
-            st.session_state.last_source_name = source_name
+    remembered_db_paths = st.session_state.get("last_data_db_paths", [])
+    if data_path is None and source_mode == "ihm_folder" and remembered_db_paths:
+        valid_db_paths = [p for p in remembered_db_paths if Path(p).exists()]
+        if valid_db_paths:
+            data_db_paths = tuple(valid_db_paths)
+            source_name = st.session_state.get("last_source_name", "Pasta IHM")
 
-    if data_path is None:
+    if data_path is None and not data_db_paths:
         render_welcome_page()
         uploaded_file = st.file_uploader(
             "Importar arquivo de dados",
@@ -2547,19 +2993,61 @@ def main() -> None:
         if uploaded_file is not None:
             try:
                 temp_path, uploaded_name = save_uploaded_database(uploaded_file)
-                st.session_state.ignore_latest_temp_db = False
                 st.session_state.last_data_path = str(temp_path)
                 st.session_state.last_source_name = uploaded_name
                 st.session_state.last_source_label = "-"
+                st.session_state.last_data_mode = "single_file"
+                st.session_state.last_data_db_paths = []
                 st.success("Arquivo importado com sucesso.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Não consegui salvar o arquivo enviado: {e}")
+
+        st.markdown("### Importar dados da IHM")
+        ihm_uploaded_files = render_ihm_db_uploader(
+            upload_key=f"ihm_upload_{st.session_state.file_uploader_nonce}"
+        )
+        if ihm_uploaded_files:
+            ihm_source_name, ihm_source_label = build_ihm_upload_metadata(ihm_uploaded_files)
+            saved_db_files = save_uploaded_ihm_databases(ihm_uploaded_files)
+            if not saved_db_files:
+                st.error(
+                    "Nenhum arquivo .db válido foi encontrado em DataLogFile no conteúdo enviado."
+                )
+                st.stop()
+                return
+            saved_db_files.sort(
+                key=lambda p: (
+                    parse_chunk_index_from_stem(p.stem),
+                    p.name.lower(),
+                )
+            )
+            st.session_state.last_data_mode = "ihm_folder"
+            st.session_state.last_data_path = None
+            st.session_state.last_data_db_paths = [str(p) for p in saved_db_files]
+            st.session_state.last_source_name = ihm_source_name
+            st.session_state.last_source_label = ihm_source_label
+            st.success(f"Upload IHM carregado com sucesso ({len(saved_db_files)} arquivos).")
+            st.rerun()
         st.stop()
         return
 
     selected_table = "TXT"
-    if data_path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+    is_txt_source = data_path is not None and data_path.suffix.lower() == ".txt"
+    is_ihm_folder_source = bool(data_db_paths)
+    if is_ihm_folder_source:
+        try:
+            tables = list_tables_from_many_databases(data_db_paths)
+        except Exception as e:
+            st.error(f"Não consegui abrir os bancos da pasta IHM: {e}")
+            st.stop()
+            return
+
+        if not tables:
+            st.error("Não encontramos dados para exibir nos bancos da pasta IHM.")
+            st.stop()
+            return
+    elif data_path is not None and data_path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
         try:
             tables = list_tables(str(data_path))
         except Exception as e:
@@ -2587,19 +3075,33 @@ def main() -> None:
 
     if active_view == "Submeter novos dados":
         st.session_state.pop("last_data_path", None)
+        st.session_state.pop("last_data_db_paths", None)
+        st.session_state.pop("last_data_mode", None)
         st.session_state.pop("last_source_name", None)
         st.session_state.pop("last_source_label", None)
-        st.session_state.ignore_latest_temp_db = True
         st.session_state.file_uploader_nonce = st.session_state.get("file_uploader_nonce", 0) + 1
         st.session_state.reset_main_view_next_run = True
         st.rerun()
 
     try:
-        if data_path.suffix.lower() == ".txt":
+        if is_txt_source:
             raw_df, parsed_name = parse_datalogger_txt(str(data_path))
             source_label = parsed_name
             st.session_state.last_source_label = source_label
             df = normalize_dataframe(raw_df)
+        elif is_ihm_folder_source:
+            default_table = "DataGrpData" if "DataGrpData" in tables else tables[0]
+            selected_table = default_table
+            raw_df = read_table_from_many_databases(data_db_paths, selected_table)
+            df = normalize_dataframe(raw_df)
+            df = apply_alarm_rules(
+                df,
+                high_limit=TEMP_HIGH_ALARM_LIMIT,
+                low_limit=TEMP_LOW_ALARM_LIMIT_TXT,
+            )
+            if "last_source_label" not in st.session_state:
+                st.session_state.last_source_label = "-"
+            source_label = st.session_state.get("last_source_label", "-")
         else:
             default_table = "DataGrpData" if "DataGrpData" in tables else tables[0]
             selected_table = default_table
@@ -2652,10 +3154,7 @@ def main() -> None:
             else:
                 k4.metric("Menor temperatura", "-")
 
-        plot_columns = get_preferred_plot_columns(
-            filtered_df,
-            is_txt_source=(data_path.suffix.lower() == ".txt"),
-        )
+        plot_columns = get_preferred_plot_columns(filtered_df, is_txt_source=is_txt_source)
         default_plot_columns = [
             col for col in ["Tprincipal", "Setpoint"]
             if col in plot_columns
@@ -2668,19 +3167,61 @@ def main() -> None:
         render_main_plot(filtered_df, selected_plot_columns)
 
     elif active_view == "Dados completos":
-        st.subheader("Dados completos")
-        search_text = st.text_input(
-            "Buscar nos dados",
-            placeholder="Digite uma palavra, número ou data",
+        source_stem = Path(source_name).stem if source_name else "arquivo"
+        if is_txt_source:
+            source_stem = extract_txt_device_name(source_label, fallback=source_stem)
+        components.html(
+            f"""
+            <div style="
+                color: #0b1e3a;
+                font-size: 86px;
+                font-weight: 800;
+                letter-spacing: -0.02em;
+                line-height: 1.05;
+                margin: 0;
+                padding: 0;
+                font-family: inherit;
+            ">{source_stem}</div>
+            """,
+            height=110,
         )
+        search_key = "dados_completos_search_text"
+        search_text = st.session_state.get(search_key, "")
         display_df = prepare_display_dataframe(df)
         if search_text:
-            display_df = display_df[
-                display_df.astype(str).apply(
-                    lambda row: row.str.contains(search_text, case=False, na=False).any(),
-                    axis=1,
+            match_mask = pd.Series(False, index=display_df.index)
+            for col in display_df.columns:
+                match_mask |= (
+                    display_df[col]
+                    .astype(str)
+                    .str.contains(search_text, case=False, na=False, regex=False)
                 )
-            ]
+            display_df = display_df[match_mask]
+
+        summary_time_col = next(
+            (col for col in ["Data e hora", "Início", "Fim"] if col in display_df.columns and display_df[col].notna().any()),
+            None,
+        )
+        if summary_time_col and not display_df.empty:
+            time_values = display_df[summary_time_col].dropna()
+            if not time_values.empty:
+                first_when = format_datetime(time_values.iloc[0])
+                last_when = format_datetime(time_values.iloc[-1])
+                st.markdown(
+                    (
+                        "<div class='data-complete-range'>"
+                        "<div class='data-complete-range-card'>"
+                        "<div class='data-complete-range-label'>Primeiro registro</div>"
+                        f"<div class='data-complete-range-value'>{first_when}</div>"
+                        "</div>"
+                        "<div class='data-complete-range-card'>"
+                        "<div class='data-complete-range-label'>Último registro</div>"
+                        f"<div class='data-complete-range-value'>{last_when}</div>"
+                        "</div>"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
 
         chip_col, dl_col, report_col = st.columns([2.4, 1, 1.2])
         with chip_col:
@@ -2693,10 +3234,7 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
         with dl_col:
-            excel_buffer = BytesIO()
-            display_df.to_excel(excel_buffer, index=False, sheet_name="Dados")
-            excel_data = excel_buffer.getvalue()
-            source_stem = Path(source_name).stem if source_name else "arquivo"
+            excel_data = dataframe_to_excel_bytes(display_df)
             st.download_button(
                 "Exportar Excel",
                 data=excel_data,
@@ -2719,7 +3257,18 @@ def main() -> None:
                     end_dt.time().replace(microsecond=0),
                 )
 
-            report_pdf = build_report_pdf(period_df_for_report, source_name, source_label=source_label)
+            report_low_limit = (
+                TEMP_LOW_ALARM_LIMIT_TXT
+                if (is_txt_source or is_ihm_folder_source)
+                else TEMP_LOW_ALARM_LIMIT
+            )
+            report_pdf = build_report_pdf(
+                period_df_for_report,
+                source_name,
+                source_label=source_label,
+                high_limit=TEMP_HIGH_ALARM_LIMIT,
+                low_limit=report_low_limit,
+            )
             source_stem = Path(source_name).stem if source_name else "arquivo"
             st.download_button(
                 "Gerar Relatório",
@@ -2738,10 +3287,44 @@ def main() -> None:
                 glyph="∅",
             )
         else:
-            st.dataframe(display_df, use_container_width=True, hide_index=True, height=540)
+            table_df = display_df.rename(
+                columns={
+                    "indexID": "Registros",
+                    "Data e hora": "Data e Hora",
+                    "setpoint": "SetPoint",
+                    "alarme": "Alarme",
+                    "porta": "Porta",
+                }
+            )
+            table_order = [
+                "Registros", "Data e Hora", "Tprincipal", "Degelo", "SetPoint", "Tomada", "Bateria", "Alarme", "Porta",
+            ]
+            ordered_cols = [col for col in table_order if col in table_df.columns]
+            ordered_cols.extend(col for col in table_df.columns if col not in ordered_cols)
+            table_df = table_df.loc[:, ordered_cols]
+            table_html = table_df.to_html(index=False, escape=True, classes="data-complete-table-inner")
+            st.markdown(
+                f"<div class='data-complete-table'>{table_html}</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.text_input(
+            "Buscar nos dados",
+            placeholder="Digite uma palavra, número ou data",
+            key=search_key,
+        )
 
     elif active_view == "Alarmes":
-        render_alarm_monitor(df)
+        alarm_low_limit = (
+            TEMP_LOW_ALARM_LIMIT_TXT
+            if (is_txt_source or is_ihm_folder_source)
+            else TEMP_LOW_ALARM_LIMIT
+        )
+        render_alarm_monitor(
+            df,
+            high_limit=TEMP_HIGH_ALARM_LIMIT,
+            low_limit=alarm_low_limit,
+        )
 
 
 if __name__ == "__main__":
